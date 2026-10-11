@@ -15,11 +15,11 @@
 #include <thread>
 #include <vector>
 
-/* Internal context definition */
+/* Internal context definition - prefixed with 'struct' to fix latest API breakages */
 struct infer_ctx {
-    llama_model*   model   = nullptr;
-    llama_context* lctx    = nullptr;
-    llama_sampler* sampler = nullptr;
+    struct llama_model*   model   = nullptr;
+    struct llama_context* lctx    = nullptr;
+    struct llama_sampler* sampler = nullptr;
 
     infer_sampler_params sampler_params{};
     uint32_t             n_ctx = 0;
@@ -66,7 +66,7 @@ static ggml_backend_dev_t infer_get_optimal_device() {
 }
 
 /* Auto-clamps n_ctx dynamically using hardware VRAM queries */
-static uint32_t calculate_safe_n_ctx(llama_model* model, uint32_t requested_ctx) {
+static uint32_t calculate_safe_n_ctx(struct llama_model* model, uint32_t requested_ctx) {
     int32_t n_layer   = llama_model_n_layer(model);
     int32_t n_head_kv = llama_model_n_head_kv(model);
     int32_t n_head    = llama_model_n_head(model);
@@ -105,9 +105,9 @@ static uint32_t calculate_safe_n_ctx(llama_model* model, uint32_t requested_ctx)
     return std::min<uint32_t>(requested_ctx, safe_tokens);
 }
 
-static llama_sampler* create_sampler(const infer_sampler_params& params) {
-    llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
-    llama_sampler* chain = llama_sampler_chain_init(sparams);
+static struct llama_sampler* create_sampler(const infer_sampler_params& params) {
+    struct llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
+    struct llama_sampler* chain = llama_sampler_chain_init(sparams);
 
     if (params.top_k > 0) {
         llama_sampler_chain_add(chain, llama_sampler_init_top_k(params.top_k));
@@ -151,9 +151,9 @@ bool infer_load_model(infer_ctx* ctx, const char* path, uint32_t requested_ctx) 
 
     if (ctx->sampler) { llama_sampler_free(ctx->sampler); ctx->sampler = nullptr; }
     if (ctx->lctx)    { llama_free(ctx->lctx); ctx->lctx = nullptr; }
-    if (ctx->model)   { llama_free_model(ctx->model); ctx->model = nullptr; }
+    if (ctx->model)   { llama_model_free(ctx->model); ctx->model = nullptr; } // Updated from llama_free_model
 
-    llama_model_params model_params = llama_model_default_params();
+    struct llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = 999;
 
     ctx->model = llama_load_model_from_file(path, model_params);
@@ -164,13 +164,13 @@ bool infer_load_model(infer_ctx* ctx, const char* path, uint32_t requested_ctx) 
 
     ctx->n_ctx = calculate_safe_n_ctx(ctx->model, requested_ctx);
 
-    llama_context_params ctx_params = llama_context_default_params();
+    struct llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx   = ctx->n_ctx;
     ctx_params.n_batch = std::min<uint32_t>(ctx->n_ctx, 512);
 
     ctx->lctx = llama_new_context_with_model(ctx->model, ctx_params);
     if (!ctx->lctx) {
-        llama_free_model(ctx->model);
+        llama_model_free(ctx->model);
         ctx->model = nullptr;
         ctx->set_error("Failed to instantiate llama context.");
         return false;
@@ -227,18 +227,19 @@ bool infer_generate_chat(
     }
     ctx->clear_error();
 
-    const llama_vocab* vocab = llama_model_get_vocab(ctx->model);
+    const struct llama_vocab* vocab = llama_model_get_vocab(ctx->model);
     const char* chat_template = llama_model_chat_template(ctx->model, nullptr);
 
     // 1. Convert messages for Jinja processing
-    std::vector<llama_chat_message> llama_msgs;
+    std::vector<struct llama_chat_message> llama_msgs;
     llama_msgs.reserve(num_msgs);
     for (size_t i = 0; i < num_msgs; ++i) {
         llama_msgs.push_back({ msgs[i].role, msgs[i].content });
     }
 
-    // 2. Pass 1: Determine template buffer size
+    // 2. Pass 1: Determine template buffer size (API Updated to require ctx->model as arg 1)
     int alloc_size = llama_chat_apply_template(
+        ctx->model,
         chat_template,
         llama_msgs.data(),
         llama_msgs.size(),
@@ -255,6 +256,7 @@ bool infer_generate_chat(
     // 3. Pass 2: Format prompt
     std::vector<char> formatted(alloc_size + 1, '\0');
     int written = llama_chat_apply_template(
+        ctx->model,
         chat_template,
         llama_msgs.data(),
         llama_msgs.size(),
@@ -302,10 +304,10 @@ bool infer_generate_chat(
     llama_sampler_reset(ctx->sampler);
 
     const int32_t batch_cap = 512;
-    llama_batch batch = llama_batch_init(batch_cap, 0, 1);
+    struct llama_batch batch = llama_batch_init(batch_cap, 0, 1);
 
     struct BatchGuard {
-        llama_batch& b;
+        struct llama_batch& b;
         ~BatchGuard() { llama_batch_free(b); }
     } guard{batch};
 
@@ -338,18 +340,15 @@ bool infer_generate_chat(
     int n_cur = static_cast<int>(prompt_tokens.size());
     int n_keep = (prompt_tokens.size() > 64) ? 64 : std::min<int>(static_cast<int>(prompt_tokens.size()), 1);
 
-    // Guardrail: Ensure preserved prefix never starves the active window
     if (n_keep >= static_cast<int>(ctx->n_ctx) - 8) {
         n_keep = std::max<int>(0, static_cast<int>(ctx->n_ctx) / 4);
     }
 
     while (true) {
-        // Abort check
         if (ctx->abort_flag.load()) {
             break;
         }
 
-        // Context Shifting: Drop middle conversation tokens to make space
         if (n_cur >= static_cast<int>(ctx->n_ctx) - 4) {
             int n_discard = (ctx->n_ctx - n_keep) / 2;
             if (n_discard <= 0) n_discard = 1;
@@ -360,7 +359,6 @@ bool infer_generate_chat(
             n_cur -= n_discard;
         }
 
-        // Sampling
         llama_token new_token_id = llama_sampler_sample(ctx->sampler, ctx->lctx, -1);
         llama_sampler_accept(ctx->sampler, new_token_id);
 
@@ -368,7 +366,6 @@ bool infer_generate_chat(
             break;
         }
 
-        // Detokenization & Streaming
         char piece_buf[128];
         int n_chars = llama_token_to_piece(vocab, new_token_id, piece_buf, sizeof(piece_buf), 0, true);
         if (n_chars > 0) {
@@ -379,7 +376,6 @@ bool infer_generate_chat(
             }
         }
 
-        // Autoregressive step
         batch.n_tokens = 0;
         batch.token[0]    = new_token_id;
         batch.pos[0]      = static_cast<llama_pos>(n_cur);
@@ -408,7 +404,6 @@ bool infer_generate_chat_async(
 ) {
     if (!ctx || !msgs || num_msgs == 0 || !callback) return false;
 
-    // Join previous background task if completed, or reject if still running
     if (ctx->async_worker.joinable()) {
         if (ctx->is_generating.load()) {
             ctx->set_error("An inference worker is already active.");
@@ -417,11 +412,9 @@ bool infer_generate_chat_async(
         ctx->async_worker.join();
     }
 
-    // Reset runtime flags
     ctx->abort_flag.store(false);
     ctx->is_generating.store(true);
 
-    // Deep-copy message strings into owned memory before passing to lambda
     std::vector<OwnedMsg> owned;
     owned.reserve(num_msgs);
     for (size_t i = 0; i < num_msgs; ++i) {
@@ -431,7 +424,6 @@ bool infer_generate_chat_async(
         });
     }
 
-    // Dispatch safely with owned copies
     ctx->async_worker = std::thread([ctx, owned_msgs = std::move(owned), callback, user_data]() {
         std::vector<infer_chat_msg> view(owned_msgs.size());
         for (size_t i = 0; i < owned_msgs.size(); ++i) {
@@ -449,7 +441,6 @@ bool infer_generate_chat_async(
 void infer_free(infer_ctx* ctx) {
     if (!ctx) return;
 
-    // Halt any active async threads before releasing graphs
     ctx->abort_flag.store(true);
     if (ctx->async_worker.joinable()) {
         ctx->async_worker.join();
@@ -464,7 +455,7 @@ void infer_free(infer_ctx* ctx) {
         ctx->lctx = nullptr;
     }
     if (ctx->model) {
-        llama_free_model(ctx->model);
+        llama_model_free(ctx->model); // Updated from llama_free_model
         ctx->model = nullptr;
     }
 
