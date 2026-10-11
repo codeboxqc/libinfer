@@ -7,7 +7,6 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
-# 1. CRITICAL: Give the workflow permission to create releases
 permissions:
   contents: write 
 
@@ -59,14 +58,8 @@ jobs:
       shell: bash
       run: |
         mkdir -p staging
-        
-        # Recursively search the entire build tree and gather all shared libraries
         find build -name "*.${{ matrix.ext }}" -exec cp {} staging/ \;
-        
-        # Find and copy the CLI test executable
         find build -name "${{ matrix.cli }}" -type f -exec cp {} staging/ \;
-        
-        # Copy the pure C-API header
         cp include/infer.h staging/
 
     - name: Upload Binaries
@@ -75,25 +68,34 @@ jobs:
         name: libinfer-${{ matrix.name }}
         path: staging/
 
-  # 2. NEW DEDICATED RELEASE JOB
   release:
-    needs: build # This ensures it waits for Windows, Mac, and Linux to finish
+    needs: build 
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' # Only create releases when pushing to main
+    if: github.ref == 'refs/heads/main' 
 
     steps:
-      # Step A: Download all 3 artifacts from the build job above
       - name: Download all built artifacts
         uses: actions/download-artifact@v4
         with:
           path: all-binaries
 
-      # Step B: Automatically create/update a release using the downloaded files
+      - name: Zip binaries by OS
+        shell: bash
+        run: |
+          cd all-binaries
+          # Loop through each OS folder, go inside, zip the files, and place the zip outside
+          for dir in */; do
+            dir_name="${dir%/}"
+            cd "$dir_name"
+            zip -r "../${dir_name}.zip" ./*
+            cd ..
+          done
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "latest" # Updates the "latest" tag automatically
+          tag_name: "latest" 
           name: "Latest Development Build"
           prerelease: true
-          # Grabs every file downloaded from the artifacts and uploads them to the release page
-          files: all-binaries/**/*
+          # Only attach the newly created .zip files
+          files: all-binaries/*.zip
