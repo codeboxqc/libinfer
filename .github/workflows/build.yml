@@ -3,12 +3,13 @@ name: Build libinfer (Cross-Platform)
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
 
 permissions:
-  contents: write 
+  contents: write
 
 jobs:
   build:
@@ -18,14 +19,17 @@ jobs:
         include:
           - os: windows-latest
             name: windows-x64
+            bin_dir: build/Release
             ext: dll
             cli: infer_cli.exe
           - os: ubuntu-latest
             name: linux-x64
+            bin_dir: build
             ext: so
             cli: infer_cli
           - os: macos-latest
             name: macos-arm64
+            bin_dir: build
             ext: dylib
             cli: infer_cli
 
@@ -58,44 +62,32 @@ jobs:
       shell: bash
       run: |
         mkdir -p staging
-        find build -name "*.${{ matrix.ext }}" -exec cp {} staging/ \;
-        find build -name "${{ matrix.cli }}" -type f -exec cp {} staging/ \;
+        cp ${{ matrix.bin_dir }}/*infer*.* staging/ 2>/dev/null || true
+        cp ${{ matrix.bin_dir }}/*ggml*.* staging/ 2>/dev/null || true
+        cp ${{ matrix.bin_dir }}/${{ matrix.cli }} staging/ 2>/dev/null || true
         cp include/infer.h staging/
 
-    - name: Upload Binaries
+    - name: Package Zip
+      shell: bash
+      run: |
+        cd staging
+        if [ "${{ runner.os }}" = "Windows" ]; then
+          7z a ../libinfer-${{ matrix.name }}.zip *
+        else
+          zip -r ../libinfer-${{ matrix.name }}.zip *
+        fi
+
+    - name: Upload Actions Artifact
       uses: actions/upload-artifact@v4
       with:
         name: libinfer-${{ matrix.name }}
-        path: staging/
+        path: libinfer-${{ matrix.name }}.zip
 
-  release:
-    needs: build 
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' 
-
-    steps:
-      - name: Download all built artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: all-binaries
-
-      - name: Zip binaries by OS
-        shell: bash
-        run: |
-          cd all-binaries
-          # Loop through each OS folder, go inside, zip the files, and place the zip outside
-          for dir in */; do
-            dir_name="${dir%/}"
-            cd "$dir_name"
-            zip -r "../${dir_name}.zip" ./*
-            cd ..
-          done
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: "latest" 
-          name: "Latest Development Build"
-          prerelease: true
-          # Only attach the newly created .zip files
-          files: all-binaries/*.zip
+    - name: Publish to GitHub Releases
+      uses: softprops/action-gh-release@v2
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+      with:
+        tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
+        name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'Latest Build' }}
+        prerelease: false
+        files: libinfer-${{ matrix.name }}.zip
