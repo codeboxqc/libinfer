@@ -19,17 +19,14 @@ jobs:
         include:
           - os: windows-latest
             name: windows-x64
-            bin_dir: build/Release
             ext: dll
             cli: infer_cli.exe
           - os: ubuntu-latest
             name: linux-x64
-            bin_dir: build
             ext: so
             cli: infer_cli
           - os: macos-latest
             name: macos-arm64
-            bin_dir: build
             ext: dylib
             cli: infer_cli
 
@@ -62,9 +59,17 @@ jobs:
       shell: bash
       run: |
         mkdir -p staging
-        cp ${{ matrix.bin_dir }}/*infer*.* staging/ 2>/dev/null || true
-        cp ${{ matrix.bin_dir }}/*ggml*.* staging/ 2>/dev/null || true
-        cp ${{ matrix.bin_dir }}/${{ matrix.cli }} staging/ 2>/dev/null || true
+        
+        # 1. Gather all compiled shared libraries (dll, so, dylib)
+        find build -name "*.${{ matrix.ext }}" -exec cp {} staging/ \;
+        
+        # 2. Gather all compiled static link libraries (.lib files for Windows MSVC)
+        find build -name "*.lib" -exec cp {} staging/ \;
+        
+        # 3. Gather the CLI executable
+        find build -name "${{ matrix.cli }}" -type f -exec cp {} staging/ \;
+        
+        # 4. Gather the C header
         cp include/infer.h staging/
 
     - name: Package Zip
@@ -83,11 +88,23 @@ jobs:
         name: libinfer-${{ matrix.name }}
         path: libinfer-${{ matrix.name }}.zip
 
+  # Dedicated release job prevents matrix collisions
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    
+    steps:
+    - name: Download all zipped artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: all-binaries
+        merge-multiple: true # Flattens the downloads so all 3 zips sit in the same folder
+
     - name: Publish to GitHub Releases
       uses: softprops/action-gh-release@v2
-      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
       with:
         tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
         name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'Latest Build' }}
-        prerelease: false
-        files: libinfer-${{ matrix.name }}.zip
+        prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        files: all-binaries/*.zip
