@@ -32,20 +32,16 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-    - name: Checkout Code and Submodules
+    - name: Checkout Code
       uses: actions/checkout@v4
-      with:
-        submodules: recursive
 
-    - name: Force Clone llama.cpp (Submodule Failsafe)
+    # FIX 1: Pin llama.cpp to a stable release tag (b3600) instead of unstable master
+    - name: Force Clone Stable llama.cpp
       shell: bash
       run: |
-        if [ ! -f "third_party/llama.cpp/CMakeLists.txt" ]; then
-          echo "Submodule missing or empty. Cloning directly with submodules..."
-          rm -rf third_party/llama.cpp
-          mkdir -p third_party
-          git clone --recurse-submodules https://github.com/ggerganov/llama.cpp.git third_party/llama.cpp
-        fi
+        rm -rf third_party/llama.cpp
+        mkdir -p third_party
+        git clone --depth 1 --branch b3600 https://github.com/ggerganov/llama.cpp.git third_party/llama.cpp
 
     - name: Install CUDA Toolkit
       if: runner.os != 'macOS'
@@ -53,8 +49,9 @@ jobs:
       with:
         cuda: '12.4.0'
 
+    # FIX 2: Explicitly disable GGML_NATIVE to resolve the dynamic backend conflict
     - name: Configure CMake
-      run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
 
     - name: Build Project
       run: cmake --build build --config Release --parallel 4
