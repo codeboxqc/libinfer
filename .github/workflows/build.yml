@@ -3,12 +3,14 @@ name: Build libinfer (Cross-Platform)
 on:
   push:
     branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
   build:
     strategy:
-      fail-fast: false # If one OS fails, do not cancel the others
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
@@ -35,32 +37,37 @@ jobs:
       with:
         submodules: recursive
 
-    # 1. Install CUDA Toolkit (Skipped on macOS, which uses Apple Metal)
+    - name: Force Clone llama.cpp (Submodule Failsafe)
+      shell: bash
+      run: |
+        if [ ! -f "third_party/llama.cpp/CMakeLists.txt" ]; then
+          echo "Submodule missing or empty. Cloning directly with submodules..."
+          rm -rf third_party/llama.cpp
+          mkdir -p third_party
+          git clone --recurse-submodules https://github.com/ggerganov/llama.cpp.git third_party/llama.cpp
+        fi
+
     - name: Install CUDA Toolkit
       if: runner.os != 'macOS'
       uses: Jimver/cuda-toolkit@v0.2.36
       with:
         cuda: '12.4.0'
 
-    # 2. Configure CMake (Automatically selects MSVC, GCC, or Clang based on OS)
     - name: Configure CMake
       run: cmake -B build -DCMAKE_BUILD_TYPE=Release
 
-    # 3. Build the core library and hardware modules
     - name: Build Project
       run: cmake --build build --config Release --parallel 4
 
-    # 4. Stage ONLY the finished binaries (Prevents uploading 5GB of object files)
     - name: Stage Artifacts
       shell: bash
       run: |
-        mkdir staging
-        cp ${{ matrix.bin_dir }}/*infer*.${{ matrix.ext }} staging/ || true
-        cp ${{ matrix.bin_dir }}/*ggml*.${{ matrix.ext }} staging/ || true
-        cp ${{ matrix.bin_dir }}/${{ matrix.cli }} staging/ || true
+        mkdir -p staging
+        cp ${{ matrix.bin_dir }}/*infer*.${{ matrix.ext }} staging/ 2>/dev/null || true
+        cp ${{ matrix.bin_dir }}/*ggml*.${{ matrix.ext }} staging/ 2>/dev/null || true
+        cp ${{ matrix.bin_dir }}/${{ matrix.cli }} staging/ 2>/dev/null || true
         cp include/infer.h staging/
 
-    # 5. Upload the clean binaries to the GitHub Release page
     - name: Upload Binaries
       uses: actions/upload-artifact@v4
       with:
