@@ -1,43 +1,35 @@
-name: Build libinfer
+name: Build libinfer for All Platforms
 
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch: # Allows you to click a "Run workflow" button in GitHub
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  build-cross-platform:
+    strategy:
+      matrix:
+        # This tells GitHub to spin up 3 separate servers at the same time
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    
+    runs-on: ${{ matrix.os }}
 
     steps:
-    - name: Checkout Code and Submodules
+    - name: Checkout Code
       uses: actions/checkout@v4
       with:
-        submodules: recursive # CRITICAL: Without this, third_party/llama.cpp will be empty
-
-    - name: Install NVIDIA CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.36
-      id: cuda-toolkit
-      with:
-        cuda: '12.4.0' # Provides nvcc for compiling the ggml-cuda module
+        submodules: recursive
 
     - name: Configure CMake
-      run: >
-        cmake -B build 
-        -G "Visual Studio 18 2026"
-        -A x64 
-        -DCMAKE_BUILD_TYPE=Release
+      # Notice the -G "Visual Studio" is REMOVED. 
+      # This allows CMake to auto-detect the correct compiler for the OS.
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release
 
-    - name: Compile Release Binaries
+    - name: Build Project
       run: cmake --build build --config Release --parallel 4
 
-    - name: Upload Binaries as Artifacts
+    - name: Upload Binaries
       uses: actions/upload-artifact@v4
       with:
-        name: libinfer-windows-x64
-        path: |
-          build/Release/infer.dll
-          build/Release/infer_core.lib
-          build/Release/ggml-cuda.dll
-          build/Release/infer_cli.exe
-          include/infer.h
+        name: libinfer-${{ matrix.os }}-binaries
+        # Uploads the entire build folder containing the .dll, .so, or .dylib
+        path: build/
