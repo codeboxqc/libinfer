@@ -55,6 +55,11 @@ When you build or download `libinfer`, the compilation produces standard platfor
 
 ---
 
+
+<img width="709" height="301" alt="2" src="https://github.com/user-attachments/assets/37afa1bb-3d0f-451d-a063-f79921a6e72b" />
+<img width="632" height="357" alt="Untitled" src="https://github.com/user-attachments/assets/a67eaf35-7197-4278-82db-682f1ee437a8" />
+
+
 ## 🚀 Quick Start Guide
 
 ### Step 1: Get the Pre-Built Binaries
