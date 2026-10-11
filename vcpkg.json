@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.json.schema",
+  "name": "libinfer",
+  "version-string": "0.1.0",
+  "description": "Cross-platform high-performance dynamic inference library based on llama.cpp",
+  "homepage": "https://github.com/codeboxqc/libinfer",
+  "license": "MIT",
+  "dependencies": [
+    "llama-cpp"
+  ]
+}
