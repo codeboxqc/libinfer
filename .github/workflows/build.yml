@@ -7,6 +7,10 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
+# 1. CRITICAL: Give the workflow permission to create releases
+permissions:
+  contents: write 
+
 jobs:
   build:
     strategy:
@@ -70,3 +74,26 @@ jobs:
       with:
         name: libinfer-${{ matrix.name }}
         path: staging/
+
+  # 2. NEW DEDICATED RELEASE JOB
+  release:
+    needs: build # This ensures it waits for Windows, Mac, and Linux to finish
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' # Only create releases when pushing to main
+
+    steps:
+      # Step A: Download all 3 artifacts from the build job above
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-binaries
+
+      # Step B: Automatically create/update a release using the downloaded files
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "latest" # Updates the "latest" tag automatically
+          name: "Latest Development Build"
+          prerelease: true
+          # Grabs every file downloaded from the artifacts and uploads them to the release page
+          files: all-binaries/**/*
