@@ -3,9 +3,13 @@ name: Build libinfer (Cross-Platform)
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -58,13 +62,32 @@ jobs:
       shell: bash
       run: |
         mkdir -p staging
-        cp ${{ matrix.bin_dir }}/*infer*.${{ matrix.ext }} staging/ 2>/dev/null || true
-        cp ${{ matrix.bin_dir }}/*ggml*.${{ matrix.ext }} staging/ 2>/dev/null || true
+        cp ${{ matrix.bin_dir }}/*infer*.* staging/ 2>/dev/null || true
+        cp ${{ matrix.bin_dir }}/*ggml*.* staging/ 2>/dev/null || true
         cp ${{ matrix.bin_dir }}/${{ matrix.cli }} staging/ 2>/dev/null || true
         cp include/infer.h staging/
 
-    - name: Upload Binaries
+    - name: Package Zip
+      shell: bash
+      run: |
+        cd staging
+        if [ "${{ runner.os }}" = "Windows" ]; then
+          7z a ../libinfer-${{ matrix.name }}.zip *
+        else
+          zip -r ../libinfer-${{ matrix.name }}.zip *
+        fi
+
+    - name: Upload Actions Artifact
       uses: actions/upload-artifact@v4
       with:
         name: libinfer-${{ matrix.name }}
-        path: staging/
+        path: libinfer-${{ matrix.name }}.zip
+
+    - name: Publish to GitHub Releases
+      uses: softprops/action-gh-release@v2
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+      with:
+        tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
+        name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'Latest Build' }}
+        prerelease: false
+        files: libinfer-${{ matrix.name }}.zip
