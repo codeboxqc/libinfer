@@ -1,35 +1,68 @@
-name: Build libinfer for All Platforms
+name: Build libinfer (Cross-Platform)
 
 on:
   push:
     branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
-  build-cross-platform:
+  build:
     strategy:
+      fail-fast: false # If one OS fails, do not cancel the others
       matrix:
-        # This tells GitHub to spin up 3 separate servers at the same time
-        os: [windows-latest, ubuntu-latest, macos-latest]
-    
+        include:
+          - os: windows-latest
+            name: windows-x64
+            bin_dir: build/Release
+            ext: dll
+            cli: infer_cli.exe
+          - os: ubuntu-latest
+            name: linux-x64
+            bin_dir: build
+            ext: so
+            cli: infer_cli
+          - os: macos-latest
+            name: macos-arm64
+            bin_dir: build
+            ext: dylib
+            cli: infer_cli
+
     runs-on: ${{ matrix.os }}
 
     steps:
-    - name: Checkout Code
+    - name: Checkout Code and Submodules
       uses: actions/checkout@v4
       with:
         submodules: recursive
 
+    # 1. Install CUDA Toolkit (Skipped on macOS, which uses Apple Metal)
+    - name: Install CUDA Toolkit
+      if: runner.os != 'macOS'
+      uses: Jimver/cuda-toolkit@v0.2.36
+      with:
+        cuda: '12.4.0'
+
+    # 2. Configure CMake (Automatically selects MSVC, GCC, or Clang based on OS)
     - name: Configure CMake
-      # Notice the -G "Visual Studio" is REMOVED. 
-      # This allows CMake to auto-detect the correct compiler for the OS.
       run: cmake -B build -DCMAKE_BUILD_TYPE=Release
 
+    # 3. Build the core library and hardware modules
     - name: Build Project
       run: cmake --build build --config Release --parallel 4
 
+    # 4. Stage ONLY the finished binaries (Prevents uploading 5GB of object files)
+    - name: Stage Artifacts
+      shell: bash
+      run: |
+        mkdir staging
+        cp ${{ matrix.bin_dir }}/*infer*.${{ matrix.ext }} staging/ || true
+        cp ${{ matrix.bin_dir }}/*ggml*.${{ matrix.ext }} staging/ || true
+        cp ${{ matrix.bin_dir }}/${{ matrix.cli }} staging/ || true
+        cp include/infer.h staging/
+
+    # 5. Upload the clean binaries to the GitHub Release page
     - name: Upload Binaries
       uses: actions/upload-artifact@v4
       with:
-        name: libinfer-${{ matrix.os }}-binaries
-        # Uploads the entire build folder containing the .dll, .so, or .dylib
-        path: build/
+        name: libinfer-${{ matrix.name }}
+        path: staging/
