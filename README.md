@@ -74,6 +74,12 @@ Download pre-compiled binaries for your operating system directly from **[GitHub
 
 Create a file named `main.c`:
 
+
+IF it slow you need bigger NVEDIA
+you canuse any ai model .gguf   
+This example is using qwen2.5-coder-7b-instruct-q4_k_m.gguf
+https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/blob/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf
+
 ```c
 #include <stdio.h>
 #include <stdlib.h>
