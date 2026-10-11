@@ -1,90 +1,100 @@
-name: Build libinfer (Cross-Platform)
+cmake_minimum_required(VERSION 3.22)
+project(libinfer VERSION 0.1.0 LANGUAGES C CXX)
 
-on:
-  push:
-    branches: [ "main" ]
-    tags: [ "v*" ]
-  pull_request:
-    branches: [ "main" ]
-  workflow_dispatch:
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-permissions:
-  contents: write
+# Export compile commands for language servers
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            name: windows-x64
-            bin_dir: build/Release
-            cli: infer_cli.exe
-          - os: ubuntu-latest
-            name: linux-x64
-            bin_dir: build
-            cli: infer_cli
-          - os: macos-latest
-            name: macos-arm64
-            bin_dir: build
-            cli: infer_cli
+# -----------------------------------------------------------------------------
+# Configuration Flags for llama.cpp Submodule
+# -----------------------------------------------------------------------------
+set(GGML_BACKEND_DL ON CACHE BOOL "Enable dynamic backend loading" FORCE)
+set(BUILD_SHARED_LIBS ON CACHE BOOL "Build shared libraries for backends" FORCE)
+set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "Do not build llama.cpp examples" FORCE)
+set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Do not build llama.cpp tests" FORCE)
+set(LLAMA_BUILD_SERVER OFF CACHE BOOL "Do not build llama.cpp server" FORCE)
 
-    runs-on: ${{ matrix.os }}
+# Add llama.cpp as third-party dependency
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/CMakeLists.txt")
+    message(WARNING "third_party/llama.cpp not found. Run 'git submodule update --init --recursive' before building.")
+else()
+    add_subdirectory(third_party/llama.cpp EXCLUDE_FROM_ALL)
+endif()
 
-    steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+# -----------------------------------------------------------------------------
+# Target: infer_core (Shared ABI Boundary)
+# -----------------------------------------------------------------------------
+add_library(infer_core SHARED
+    src/infer_core.cpp
+)
 
-    - name: Force Clone latest llama.cpp
-      shell: bash
-      run: |
-        rm -rf third_party/llama.cpp
-        mkdir -p third_party
-        git clone --depth 1 https://github.com/ggerganov/llama.cpp.git third_party/llama.cpp
+target_include_directories(infer_core
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/include
+)
 
-    - name: Install CUDA Toolkit
-      if: runner.os != 'macOS'
-      uses: Jimver/cuda-toolkit@v0.2.36
-      with:
-        cuda: '12.4.0'
+if(TARGET llama AND TARGET ggml)
+    target_link_libraries(infer_core PRIVATE llama ggml)
+endif()
 
-    - name: Configure CMake
-      run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
+# Enforce strict symbol visibility: hide internal symbols by default
+set_target_properties(infer_core PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+    POSITION_INDEPENDENT_CODE ON
+    OUTPUT_NAME "infer"
+)
 
-    - name: Build Project
-      run: cmake --build build --config Release --parallel 4
+# Export macro definitions for DLL/SO symbol visibility
+target_compile_definitions(infer_core
+    PRIVATE
+        INFER_BUILD_SHARED
+)
 
-    - name: Stage Artifacts
-      shell: bash
-      run: |
-        mkdir -p staging
-        cp ${{ matrix.bin_dir }}/*infer*.* staging/ 2>/dev/null || true
-        cp ${{ matrix.bin_dir }}/*ggml*.* staging/ 2>/dev/null || true
-        cp ${{ matrix.bin_dir }}/${{ matrix.cli }} staging/ 2>/dev/null || true
-        cp include/infer.h staging/
+# -----------------------------------------------------------------------------
+# Demonstration: Hardware Backend Module (infer_cuda)
+# Compiles as a runtime-loadable MODULE without direct linkage from infer_core
+# -----------------------------------------------------------------------------
+include(CheckLanguage)
+check_language(CUDA)
 
-    - name: Package Zip
-      shell: bash
-      run: |
-        cd staging
-        if [ "${{ runner.os }}" = "Windows" ]; then
-          7z a ../libinfer-${{ matrix.name }}.zip *
-        else
-          zip -r ../libinfer-${{ matrix.name }}.zip *
-        fi
+if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/src/ggml-cuda.cu")
+    enable_language(CUDA)
+    message(STATUS "CUDA compiler detected: ${CMAKE_CUDA_COMPILER}. Building infer_cuda backend module.")
 
-    - name: Upload Actions Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: libinfer-${{ matrix.name }}
-        path: libinfer-${{ matrix.name }}.zip
+    add_library(infer_cuda MODULE
+        third_party/llama.cpp/ggml/src/ggml-cuda.cu
+    )
 
-    - name: Publish to GitHub Releases
-      uses: softprops/action-gh-release@v2
-      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
-      with:
-        tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
-        name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'Latest Build' }}
-        prerelease: false
-        files: libinfer-${{ matrix.name }}.zip
+    target_include_directories(infer_cuda PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/include
+    )
+
+    if(TARGET ggml)
+        target_link_libraries(infer_cuda PRIVATE ggml)
+    endif()
+
+    set_target_properties(infer_cuda PROPERTIES
+        CUDA_ARCHITECTURES "all"
+        CUDA_SEPARABLE_COMPILATION ON
+        PREFIX "" # Generates infer_cuda.so / infer_cuda.dll directly
+        OUTPUT_NAME "ggml-cuda" # Matches the ggml-backend-dl discovery scanner
+    )
+endif()
+
+# -----------------------------------------------------------------------------
+# Example CLI target
+# -----------------------------------------------------------------------------
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/main.c")
+    add_executable(infer_cli examples/main.c)
+    target_link_libraries(infer_cli PRIVATE infer_core)
+    target_include_directories(infer_cli PRIVATE include)
+endif()
