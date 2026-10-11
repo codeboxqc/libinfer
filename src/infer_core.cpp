@@ -15,7 +15,7 @@
 #include <thread>
 #include <vector>
 
-/* Internal context definition - prefixed with 'struct' to fix latest API breakages */
+/* Internal context definition */
 struct infer_ctx {
     struct llama_model*   model   = nullptr;
     struct llama_context* lctx    = nullptr;
@@ -55,7 +55,8 @@ static ggml_backend_dev_t infer_get_optimal_device() {
 
     for (size_t i = 0; i < dev_count; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEV_TYPE_GPU) {
+        // FIX: API renamed DEV_TYPE to DEVICE_TYPE
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
             return dev;
         }
         if (!fallback_dev) {
@@ -151,12 +152,13 @@ bool infer_load_model(infer_ctx* ctx, const char* path, uint32_t requested_ctx) 
 
     if (ctx->sampler) { llama_sampler_free(ctx->sampler); ctx->sampler = nullptr; }
     if (ctx->lctx)    { llama_free(ctx->lctx); ctx->lctx = nullptr; }
-    if (ctx->model)   { llama_model_free(ctx->model); ctx->model = nullptr; } // Updated from llama_free_model
+    if (ctx->model)   { llama_model_free(ctx->model); ctx->model = nullptr; }
 
     struct llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = 999;
 
-    ctx->model = llama_load_model_from_file(path, model_params);
+    // FIX: Updated from llama_load_model_from_file
+    ctx->model = llama_model_load_from_file(path, model_params);
     if (!ctx->model) {
         ctx->set_error("Failed to load model weights: " + std::string(path));
         return false;
@@ -168,7 +170,8 @@ bool infer_load_model(infer_ctx* ctx, const char* path, uint32_t requested_ctx) 
     ctx_params.n_ctx   = ctx->n_ctx;
     ctx_params.n_batch = std::min<uint32_t>(ctx->n_ctx, 512);
 
-    ctx->lctx = llama_new_context_with_model(ctx->model, ctx_params);
+    // FIX: Updated from llama_new_context_with_model
+    ctx->lctx = llama_init_from_model(ctx->model, ctx_params);
     if (!ctx->lctx) {
         llama_model_free(ctx->model);
         ctx->model = nullptr;
@@ -237,9 +240,8 @@ bool infer_generate_chat(
         llama_msgs.push_back({ msgs[i].role, msgs[i].content });
     }
 
-    // 2. Pass 1: Determine template buffer size (API Updated to require ctx->model as arg 1)
+    // FIX: Reverted to 6 arguments (ctx->model parameter was removed in latest master)
     int alloc_size = llama_chat_apply_template(
-        ctx->model,
         chat_template,
         llama_msgs.data(),
         llama_msgs.size(),
@@ -256,7 +258,6 @@ bool infer_generate_chat(
     // 3. Pass 2: Format prompt
     std::vector<char> formatted(alloc_size + 1, '\0');
     int written = llama_chat_apply_template(
-        ctx->model,
         chat_template,
         llama_msgs.data(),
         llama_msgs.size(),
@@ -299,8 +300,8 @@ bool infer_generate_chat(
         return false;
     }
 
-    // Prepare inference state
-    llama_kv_cache_clear(ctx->lctx);
+    // FIX: llama_kv_cache_* namespace was entirely renamed to llama_memory_*
+    llama_memory_clear(ctx->lctx);
     llama_sampler_reset(ctx->sampler);
 
     const int32_t batch_cap = 512;
@@ -353,8 +354,9 @@ bool infer_generate_chat(
             int n_discard = (ctx->n_ctx - n_keep) / 2;
             if (n_discard <= 0) n_discard = 1;
 
-            llama_kv_cache_seq_rm(ctx->lctx, 0, n_keep, n_keep + n_discard);
-            llama_kv_cache_seq_add(ctx->lctx, 0, n_keep + n_discard, n_cur, -n_discard);
+            // FIX: llama_kv_cache_seq_* was completely replaced by llama_memory_seq_*
+            llama_memory_seq_rm(ctx->lctx, 0, n_keep, n_keep + n_discard);
+            llama_memory_seq_add(ctx->lctx, 0, n_keep + n_discard, n_cur, -n_discard);
 
             n_cur -= n_discard;
         }
@@ -455,7 +457,7 @@ void infer_free(infer_ctx* ctx) {
         ctx->lctx = nullptr;
     }
     if (ctx->model) {
-        llama_model_free(ctx->model); // Updated from llama_free_model
+        llama_model_free(ctx->model);
         ctx->model = nullptr;
     }
 
