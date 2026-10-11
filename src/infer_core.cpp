@@ -55,7 +55,7 @@ static ggml_backend_dev_t infer_get_optimal_device() {
 
     for (size_t i = 0; i < dev_count; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        // FIX: API renamed DEV_TYPE to DEVICE_TYPE
+        // Updated enum name: GGML_BACKEND_DEVICE_TYPE_GPU
         if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
             return dev;
         }
@@ -157,7 +157,6 @@ bool infer_load_model(infer_ctx* ctx, const char* path, uint32_t requested_ctx) 
     struct llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = 999;
 
-    // FIX: Updated from llama_load_model_from_file
     ctx->model = llama_model_load_from_file(path, model_params);
     if (!ctx->model) {
         ctx->set_error("Failed to load model weights: " + std::string(path));
@@ -170,7 +169,6 @@ bool infer_load_model(infer_ctx* ctx, const char* path, uint32_t requested_ctx) 
     ctx_params.n_ctx   = ctx->n_ctx;
     ctx_params.n_batch = std::min<uint32_t>(ctx->n_ctx, 512);
 
-    // FIX: Updated from llama_new_context_with_model
     ctx->lctx = llama_init_from_model(ctx->model, ctx_params);
     if (!ctx->lctx) {
         llama_model_free(ctx->model);
@@ -240,7 +238,7 @@ bool infer_generate_chat(
         llama_msgs.push_back({ msgs[i].role, msgs[i].content });
     }
 
-    // FIX: Reverted to 6 arguments (ctx->model parameter was removed in latest master)
+    // 2. Pass 1: Calculate buffer allocation size
     int alloc_size = llama_chat_apply_template(
         chat_template,
         llama_msgs.data(),
@@ -300,8 +298,8 @@ bool infer_generate_chat(
         return false;
     }
 
-    // FIX: llama_kv_cache_* namespace was entirely renamed to llama_memory_*
-    llama_memory_clear(ctx->lctx);
+    // Updated API: llama_memory_clear takes llama_get_memory(ctx->lctx) and a bool flag
+    llama_memory_clear(llama_get_memory(ctx->lctx), true);
     llama_sampler_reset(ctx->sampler);
 
     const int32_t batch_cap = 512;
@@ -354,9 +352,9 @@ bool infer_generate_chat(
             int n_discard = (ctx->n_ctx - n_keep) / 2;
             if (n_discard <= 0) n_discard = 1;
 
-            // FIX: llama_kv_cache_seq_* was completely replaced by llama_memory_seq_*
-            llama_memory_seq_rm(ctx->lctx, 0, n_keep, n_keep + n_discard);
-            llama_memory_seq_add(ctx->lctx, 0, n_keep + n_discard, n_cur, -n_discard);
+            // Updated API: llama_memory_seq_* takes llama_get_memory(ctx->lctx)
+            llama_memory_seq_rm(llama_get_memory(ctx->lctx), 0, n_keep, n_keep + n_discard);
+            llama_memory_seq_add(llama_get_memory(ctx->lctx), 0, n_keep + n_discard, n_cur, -n_discard);
 
             n_cur -= n_discard;
         }
