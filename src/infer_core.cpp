@@ -53,6 +53,13 @@ struct OwnedMsg {
     std::string content;
 };
 
+/* RAII guard to ensure is_generating flag is always reset on exit */
+struct GenStateGuard {
+    std::atomic<bool>& flag;
+    GenStateGuard(std::atomic<bool>& f) : flag(f) { flag.store(true); }
+    ~GenStateGuard() { flag.store(false); }
+};
+
 /* Probes available devices to find the primary hardware accelerator */
 static ggml_backend_dev_t infer_get_optimal_device() {
     size_t dev_count = ggml_backend_dev_count();
@@ -72,14 +79,17 @@ static ggml_backend_dev_t infer_get_optimal_device() {
 
 /* Auto-clamps n_ctx dynamically using hardware VRAM queries */
 static uint32_t calculate_safe_n_ctx(struct llama_model* model, uint32_t requested_ctx) {
+    uint32_t max_train = static_cast<uint32_t>(llama_model_n_ctx_train(model));
+    uint32_t target_ctx = (requested_ctx > 0) ? requested_ctx : 4096;
+    target_ctx = std::min<uint32_t>(target_ctx, max_train);
+
     int32_t n_layer   = llama_model_n_layer(model);
     int32_t n_head_kv = llama_model_n_head_kv(model);
     int32_t n_head    = llama_model_n_head(model);
     int32_t n_embd    = llama_model_n_embd(model);
-    uint32_t max_train = static_cast<uint32_t>(llama_model_n_ctx_train(model));
 
     if (n_head <= 0 || n_layer <= 0 || n_head_kv <= 0 || n_embd <= 0) {
-        return (requested_ctx > 0) ? requested_ctx : 2048;
+        return target_ctx;
     }
 
     int32_t head_dim = n_embd / n_head;
@@ -94,20 +104,21 @@ static uint32_t calculate_safe_n_ctx(struct llama_model* model, uint32_t request
     }
 
     if (free_vram == 0) {
-        if (requested_ctx == 0) return std::min<uint32_t>(max_train, 4096);
-        return std::min<uint32_t>(requested_ctx, max_train);
+        return target_ctx;
     }
 
-    constexpr size_t headroom = 512ull * 1024ull * 1024ull;
-    size_t available_vram = (free_vram > headroom) ? (free_vram - headroom) : 0;
+    // Keep a modest 64MB margin
+    constexpr size_t headroom = 64ull * 1024ull * 1024ull;
+    size_t available_vram = (free_vram > headroom) ? (free_vram - headroom) : free_vram;
     uint32_t safe_tokens = static_cast<uint32_t>(available_vram / bytes_per_token);
 
-    constexpr uint32_t min_tokens = 512;
-    if (safe_tokens < min_tokens) safe_tokens = min_tokens;
-    safe_tokens = std::min<uint32_t>(safe_tokens, max_train);
+    // Enforce at least 2048 tokens so MilkDrop presets are never choked/truncated
+    constexpr uint32_t min_tokens = 2048;
+    if (safe_tokens < min_tokens) {
+        safe_tokens = min_tokens;
+    }
 
-    if (requested_ctx == 0) return safe_tokens;
-    return std::min<uint32_t>(requested_ctx, safe_tokens);
+    return std::min<uint32_t>(target_ctx, safe_tokens);
 }
 
 static struct llama_sampler* create_sampler(
@@ -118,7 +129,7 @@ static struct llama_sampler* create_sampler(
     struct llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
     struct llama_sampler* chain = llama_sampler_chain_init(sparams);
  
-if (params.repeat_penalty != 1.0f && params.repeat_penalty > 0.0f) {
+    if (params.repeat_penalty != 1.0f && params.repeat_penalty > 0.0f) {
         int32_t last_n = (params.repeat_last_n > 0) ? params.repeat_last_n : 64;
         
         int32_t n_vocab = 0;
@@ -469,6 +480,7 @@ void infer_memory_clear(infer_ctx* ctx) {
     }
     
     ctx->n_past = 0;
+    ctx->abort_flag.store(false);
 }
 
 bool infer_generate_chat(
@@ -483,6 +495,9 @@ bool infer_generate_chat(
         return false;
     }
     ctx->clear_error();
+    ctx->abort_flag.store(false);
+
+    GenStateGuard gen_guard(ctx->is_generating);
 
     const struct llama_vocab* vocab = llama_model_get_vocab(ctx->model);
     const char* chat_template = llama_model_chat_template(ctx->model, nullptr);
@@ -661,7 +676,6 @@ bool infer_generate_chat_async(
     }
 
     ctx->abort_flag.store(false);
-    ctx->is_generating.store(true);
 
     std::vector<OwnedMsg> owned;
     owned.reserve(num_msgs);
@@ -680,7 +694,6 @@ bool infer_generate_chat_async(
         }
 
         infer_generate_chat(ctx, view.data(), view.size(), callback, user_data);
-        ctx->is_generating.store(false);
     });
 
     return true;
@@ -698,6 +711,9 @@ bool infer_generate_chat_turn(
         return false;
     }
     ctx->clear_error();
+    ctx->abort_flag.store(false);
+
+    GenStateGuard gen_guard(ctx->is_generating);
 
     const struct llama_vocab* vocab = llama_model_get_vocab(ctx->model);
     const char* chat_template = llama_model_chat_template(ctx->model, nullptr);
@@ -835,6 +851,9 @@ bool infer_generate_completion(
         return false;
     }
     ctx->clear_error();
+    ctx->abort_flag.store(false);
+
+    GenStateGuard gen_guard(ctx->is_generating);
 
     const struct llama_vocab* vocab = llama_model_get_vocab(ctx->model);
     int written = static_cast<int>(std::strlen(raw_prompt));
