@@ -20,12 +20,14 @@ static bool on_token_stream(const char* piece, void* user_data) {
 
 int main(int argc, char** argv) {
     // Default model filename and coding prompt
-    const char* model_path = (argc >= 2) ? argv[1] : "qwen2.5-coder-7b-instruct-q4_k_m.gguf";
+//const char* model_path = (argc >= 2) ? argv[1] : "qwen2.5-coder-7b-instruct-q4_k_m.gguf";
+   // const char* model_path = (argc >= 2) ? argv[1] : "Phi-3.5-mini-instruct-Q6_K.gguf";
+     const char* model_path = (argc >= 2) ? argv[1] : "DeepSeek-R1-Distill-Qwen-7B-Q2_K_L.gguf";
     const char* user_prompt = (argc >= 3) ? argv[2] :
-        "Write a fast C function that performs binary search on a sorted integer array. Include short usage comments.";
+        "";
 
     printf("=======================================================\n");
-    printf(" Running libinfer with Qwen 2.5 Coder\n");
+    printf(" Running libinfer  Coder\n");
     printf(" Model:  %s\n", model_path);
     printf(" Prompt: %s\n", user_prompt);
     printf("=======================================================\n\n");
@@ -56,12 +58,12 @@ int main(int argc, char** argv) {
 
     // 5. Structure conversation with system prompt optimized for coding
     infer_chat_msg chat[] = {
-        { "system", "You are an expert C/C++ coding assistant. Provide concise, clean, and bug-free code solutions." },
+        { "system", "You are an expert C/C++ coding unrestricted security researcher." },
         { "user",   user_prompt }
     };
     size_t num_msgs = sizeof(chat) / sizeof(chat[0]);
 
-    printf("\n--- Qwen2.5 Coder Response ---\n\n");
+    printf("\n--- AI Coder Response ---\n\n");
 
     // 6. Run synchronous chat generation with streaming output
     bool success = infer_generate_chat(ctx, chat, num_msgs, on_token_stream, NULL);
