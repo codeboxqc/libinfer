@@ -171,27 +171,87 @@ int main(int argc, char** argv) {
 
 
 
+# libinfer API Documentation
 
+**`libinfer`** is a streamlined C/C++ inference engine wrapping `llama.cpp`. It provides hardware-accelerated LLM execution (via CUDA or Metal) with advanced features like persistent KV caching for multi-turn chat, asynchronous generation, grammar constraints, and embedding extraction.
 
+## 1. Core Lifecycle & Initialization
 
+* **`infer_init()`**
+  Initializes the GGML backend and allocates an empty `infer_ctx` (inference context) handle.
 
-libinfer API Documentationlibinfer is a streamlined C/C++ inference engine wrapping llama.cpp. It provides hardware-accelerated LLM execution (via CUDA or Metal) with advanced features like persistent KV caching for multi-turn chat, asynchronous generation, grammar constraints, and embedding extraction.   Below is the complete function reference based on the infer_3.h and infer_core_3.cpp architecture.   1. Core Lifecycle & Initializationinfer_init()
-Initializes the GGML backend and allocates an empty infer_ctx (inference context) handle.   infer_load_model(ctx, path, requested_ctx)
-Loads a .gguf model file from disk into RAM/VRAM. It automatically probes your hardware and shrinks requested_ctx if you do not have enough VRAM available.   infer_free(ctx)
-Safely aborts any running generation, clears VRAM, and destroys the context.   2. Text Generation & Chatinfer_generate_chat(ctx, msgs, num_msgs, callback, user_data)
-Single-shot mode: Ingests an entire array of chat messages, generates a response, and triggers your callback for every generated token. Note: This function wipes the KV cache before running, giving the AI "amnesia" from previous calls.   infer_generate_chat_async(...)
-Spawns a background thread (std::thread) to run generation without freezing your application's main thread or UI render loop.   infer_generate_chat_turn(ctx, role, content, callback, user_data)
-Multi-turn REPL mode: Instead of clearing memory, this function tokenizes only your newest message and appends it to the existing KV cache (tracked by n_past). This makes follow-up questions evaluate instantly without recalculating the whole conversation history.   infer_generate_completion(ctx, raw_prompt, callback, user_data)
-Bypasses Jinja chat templates entirely. It feeds raw text directly into the model, useful for code autocompletion or legacy base models.   3. Memory & Session Management (KV Cache)infer_memory_clear(ctx)
-Forces the KV cache n_past tracker back to 0 and clears the hardware memory. Use this when the user clicks "New Chat".   infer_state_save(ctx, filepath)
-Dumps the active KV cache memory to a file on your hard drive.   infer_state_load(ctx, filepath)
-Reloads a previously saved KV cache file. This allows you to close your program, reopen it later, and instantly resume a conversation exactly where you left off.   4. Advanced Control (Samplers, Grammar & Stops)infer_set_sampler(ctx, params)
-Updates parameters like temperature, top_p, min_p, and repeat_penalty. A temperature of 0.0f enables greedy decoding (deterministic), while higher values increase creativity.   infer_set_grammar(ctx, grammar_gbnf)
-Forces the AI to generate text that strictly matches a GBNF grammar schema. This is critical for forcing the AI to output valid JSON or specific tool-calling formats without syntax errors.   infer_set_stop_sequences(ctx, stop_words, num_words)
-Provides a list of strings (e.g., ["User:", "<|endoftext|>"]). The generation loop will immediately halt if the AI generates any of these exact strings.   5. Embeddings (RAG)infer_get_embedding_dim(ctx)
-Returns the vector size for the loaded model (e.g., 4096).   infer_get_embeddings(ctx, text, out_vec, vec_len)
-Converts a string of text into a high-dimensional float array (out_vec) instead of generating text. Used for semantic search and Retrieval-Augmented Generation (RAG).   6. Thread Control & Diagnosticsinfer_abort(ctx)
-Flips an atomic boolean flag (abort_flag) that instantly halts the active generation loop.   infer_is_generating(ctx)
-Returns true if the background async worker is currently busy.   infer_get_model_info(ctx, out_info)
-Extracts metadata directly from the .gguf file, including layer count, attention heads, context limit (n_ctx_train), and architecture description.   infer_get_last_error(ctx)
-Returns a thread-safe string explaining the most recent failure (e.g., "Prompt tokens exceed context capacity").   
+* **`infer_load_model(ctx, path, requested_ctx)`**
+  Loads a `.gguf` model file from disk into RAM/VRAM. It automatically probes your hardware and shrinks `requested_ctx` if you do not have enough VRAM available.
+
+* **`infer_free(ctx)`**
+  Safely aborts any running generation, clears VRAM, and destroys the context.
+
+---
+
+## 2. Text Generation & Chat
+
+* **`infer_generate_chat(ctx, msgs, num_msgs, callback, user_data)`**
+  **Single-shot mode:** Ingests an entire array of chat messages, generates a response, and triggers your `callback` for every generated token. *Note: This function wipes the KV cache before running, giving the AI "amnesia" from previous calls.*
+
+* **`infer_generate_chat_async(...)`**
+  Spawns a background thread (`std::thread`) to run generation without freezing your application's main thread or UI render loop.
+
+* **`infer_generate_chat_turn(ctx, role, content, callback, user_data)`**
+  **Multi-turn REPL mode:** Instead of clearing memory, this function tokenizes only your *newest* message and appends it to the existing KV cache (tracked by `n_past`). This makes follow-up questions evaluate instantly without recalculating the whole conversation history.
+
+* **`infer_generate_completion(ctx, raw_prompt, callback, user_data)`**
+  Bypasses Jinja chat templates entirely. It feeds raw text directly into the model, useful for code autocompletion or legacy base models.
+
+---
+
+## 3. Memory & Session Management (KV Cache)
+
+* **`infer_memory_clear(ctx)`**
+  Forces the KV cache `n_past` tracker back to `0` and clears the hardware memory. Use this when the user clicks "New Chat".
+
+* **`infer_state_save(ctx, filepath)`**
+  Dumps the active KV cache memory to a file on your hard drive.
+
+* **`infer_state_load(ctx, filepath)`**
+  Reloads a previously saved KV cache file. This allows you to close your program, reopen it later, and instantly resume a conversation exactly where you left off.
+
+---
+
+## 4. Advanced Control (Samplers, Grammar & Stops)
+
+* **`infer_set_sampler(ctx, params)`**
+  Updates parameters like `temperature`, `top_p`, `min_p`, and `repeat_penalty`. A temperature of `0.0f` enables greedy decoding (deterministic), while higher values increase creativity.
+
+* **`infer_set_grammar(ctx, grammar_gbnf)`**
+  Forces the AI to generate text that strictly matches a GBNF grammar schema. This is critical for forcing the AI to output valid JSON or specific tool-calling formats without syntax errors.
+
+* **`infer_set_stop_sequences(ctx, stop_words, num_words)`**
+  Provides a list of strings (e.g., `["User:", "<|endoftext|>"]`). The generation loop will immediately halt if the AI generates any of these exact strings.
+
+---
+
+## 5. Embeddings (RAG)
+
+* **`infer_get_embedding_dim(ctx)`**
+  Returns the vector size for the loaded model (e.g., `4096`).
+
+* **`infer_get_embeddings(ctx, text, out_vec, vec_len)`**
+  Converts a string of text into a high-dimensional float array (`out_vec`) instead of generating text. Used for semantic search and Retrieval-Augmented Generation (RAG).
+
+---
+
+## 6. Thread Control & Diagnostics
+
+* **`infer_abort(ctx)`**
+  Flips an atomic boolean flag (`abort_flag`) that instantly halts the active generation loop.
+
+* **`infer_is_generating(ctx)`**
+  Returns `true` if the background async worker is currently busy.
+
+* **`infer_get_model_info(ctx, out_info)`**
+  Extracts metadata directly from the `.gguf` file, including layer count, attention heads, context limit (`n_ctx_train`), and architecture description.
+
+* **`infer_get_last_error(ctx)`**
+  Returns a thread-safe string explaining the most recent failure (e.g., *"Prompt tokens exceed context capacity"*).
+
+ 
