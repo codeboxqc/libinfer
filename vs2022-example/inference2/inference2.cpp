@@ -27,7 +27,7 @@
 static bool on_token_stream(const char* piece, void* user_data) {
     (void)user_data;
     printf("%s", piece);
-    fflush(stdout); // Real-time terminal output[cite: 3]
+    fflush(stdout); // Real-time terminal output
     return true;
 }
 
@@ -41,14 +41,14 @@ int main(int argc, char** argv) {
     printf(" Commands: /save, /load, /clear, /quit\n");
     printf("=======================================================\n\n");
 
-    // Initialize inference context[cite: 3]
+    // Initialize inference context
     infer_ctx* ctx = infer_init();
     if (!ctx) {
         fprintf(stderr, "Error: Failed to initialize infer context.\n");
         return 1;
     }
 
-    // Load model with 2048 token context window[cite: 3]
+    // Load model with 2048 token context window
     printf("Loading model weights into memory/GPU...\n");
     if (!infer_load_model(ctx, model_path, 2048)) {
         fprintf(stderr, "\nFailed to load model '%s':\n%s\n", model_path, infer_get_last_error(ctx));
@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Set sampling parameters[cite: 3]
+    // Set sampling parameters
     infer_sampler_params sparams = infer_sampler_default_params();
     sparams.temperature = 0.60f;
     sparams.top_p = 0.95f;
@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
             break;
         }
         else if (strcmp(input_buffer, "/save") == 0) {
-            if (infer_state_save(ctx, "chat_state.bin")) { // Saves KV Cache & Session State[cite: 1]
+            if (infer_state_save(ctx, "chat_state.bin")) { // Saves KV Cache & Session State
                 printf("[System: State successfully saved to chat_state.bin]\n");
             }
             else {
@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
             continue;
         }
         else if (strcmp(input_buffer, "/load") == 0) {
-            if (infer_state_load(ctx, "chat_state.bin")) { // Loads KV Cache & Session State[cite: 1]
+            if (infer_state_load(ctx, "chat_state.bin")) { // Loads KV Cache & Session State
                 printf("[System: State successfully loaded from chat_state.bin]\n");
                 printf("[System: Current KV tokens restored to: %u]\n", infer_get_kv_cache_token_count(ctx));
             }
@@ -106,12 +106,12 @@ int main(int argc, char** argv) {
             continue;
         }
         else if (strcmp(input_buffer, "/clear") == 0) {
-            infer_memory_clear(ctx); // Clears KV cache[cite: 1]
+            infer_memory_clear(ctx); // Clears KV cache
             printf("[System: Memory cleared. KV tokens: %u]\n", infer_get_kv_cache_token_count(ctx));
             continue;
         }
 
-        // Standard user turn: uses infer_generate_chat_turn to persist memory automatically[cite: 1]
+        // Standard user turn: uses infer_generate_chat_turn to persist memory automatically
         printf("AI> ");
         bool success = infer_generate_chat_turn(ctx, "user", input_buffer, on_token_stream, NULL);
         printf("\n");
@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
         printf("[KV cache token count: %u / 2048]\n", infer_get_kv_cache_token_count(ctx));
     }
 
-    // Cleanup resources[cite: 3]
+    // Cleanup resources
     infer_free(ctx);
     printf("Inference context freed successfully.\n");
 
