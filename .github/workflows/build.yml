@@ -52,6 +52,13 @@ jobs:
       with:
         cuda: '12.4.0'
 
+    - name: Setup Ninja (For faster, reliable builds)
+      uses: seanmiddleditch/gha-setup-ninja@v4
+
+    - name: Setup MSVC Developer Command Prompt (Windows Only)
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
+
     - name: Configure CMake
       shell: bash
       run: |
@@ -59,10 +66,11 @@ jobs:
         if [ "${{ matrix.use_cuda }}" = "true" ]; then
           EXTRA_FLAGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75;80;86;89"
         fi
-        cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF $EXTRA_FLAGS
+        # Using Ninja generator (-G Ninja) fixes the "No CUDA toolset found" error
+        cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF $EXTRA_FLAGS
 
     - name: Build Project
-      run: cmake --build build --config Release --parallel 4
+      run: cmake --build build --config Release
 
     - name: Stage Artifacts
       shell: bash
