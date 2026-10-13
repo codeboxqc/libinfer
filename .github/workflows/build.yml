@@ -64,9 +64,10 @@ jobs:
       run: |
         EXTRA_FLAGS=""
         if [ "${{ matrix.use_cuda }}" = "true" ]; then
-          EXTRA_FLAGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75;80;86;89"
+          # Added -DCMAKE_CUDA_FLAGS to allow the newer Visual Studio compiler
+          EXTRA_FLAGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75;80;86;89 -DCMAKE_CUDA_FLAGS=\"-allow-unsupported-compiler\""
         fi
-        # Using Ninja generator (-G Ninja) fixes the "No CUDA toolset found" error
+        # Using Ninja generator (-G Ninja) and passing our flags
         cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF $EXTRA_FLAGS
 
     - name: Build Project
