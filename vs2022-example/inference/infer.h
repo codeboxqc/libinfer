@@ -23,6 +23,11 @@ extern "C" {
 
 /**
  * @brief Opaque handle representing the inference context.
+ * Thread-safety contract:
+ * - infer_abort, infer_is_generating, and infer_wait are safe to invoke concurrently from any thread.
+ * - Mutating calls (infer_load_model, infer_set_sampler, infer_set_grammar, infer_memory_clear)
+ *   will fail safely with an error message if an operation or generation is in progress.
+ * - Async streaming callbacks execute on the internal worker thread.
  */
 typedef struct infer_ctx infer_ctx;
 
@@ -41,7 +46,7 @@ typedef struct infer_sampler_params {
     float    min_p;         /**< <= 0.0f disables (e.g. 0.05f) */
     float    repeat_penalty;/**< 1.0f disables (e.g. 1.1f) */
     int32_t  repeat_last_n; /**< <= 0 for default 64 */
-    uint32_t seed;          /**< 0 for random */
+    uint32_t seed;          /**< 0 for random seed */
 } infer_sampler_params;
 
 /**
@@ -71,9 +76,9 @@ INFER_API bool infer_load_model(infer_ctx* ctx, const char* path, uint32_t reque
 INFER_API bool infer_set_sampler(infer_ctx* ctx, const infer_sampler_params* params);
 INFER_API void infer_free(infer_ctx* ctx);
 
-/* Model Info & Diagnostics */
+/* Diagnostics */
 INFER_API bool infer_get_model_info(infer_ctx* ctx, infer_model_info* out_info);
-INFER_API const char* infer_get_last_error(infer_ctx* ctx);
+INFER_API size_t infer_get_last_error(infer_ctx* ctx, char* out_buf, size_t buf_size);
 
 /* Tokenization & Counting */
 INFER_API int32_t infer_tokenize_count(infer_ctx* ctx, const char* text, bool add_special);
@@ -112,7 +117,7 @@ INFER_API bool infer_generate_completion(
 );
 
 /* Stop Sequences & Grammar */
-INFER_API bool infer_set_stop_sequences(infer_ctx* ctx, const char** stop_words, size_t num_words);
+INFER_API bool infer_set_stop_sequences(infer_ctx* ctx, const char* const* stop_words, size_t num_words);
 INFER_API bool infer_set_grammar(infer_ctx* ctx, const char* grammar_gbnf);
 
 /* KV Cache & Session State Save/Load */
@@ -120,7 +125,7 @@ INFER_API void infer_memory_clear(infer_ctx* ctx);
 INFER_API bool infer_state_save(infer_ctx* ctx, const char* filepath);
 INFER_API bool infer_state_load(infer_ctx* ctx, const char* filepath);
 
-/* Embeddings (RAG) */
+/* Embeddings */
 INFER_API int32_t infer_get_embedding_dim(infer_ctx* ctx);
 INFER_API bool infer_get_embeddings(infer_ctx* ctx, const char* text, float* out_vec, size_t vec_len);
 

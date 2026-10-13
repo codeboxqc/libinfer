@@ -20,11 +20,13 @@ static bool on_token_stream(const char* piece, void* user_data) {
 
 int main(int argc, char** argv) {
     // Default model filename and coding prompt
-//const char* model_path = (argc >= 2) ? argv[1] : "qwen2.5-coder-7b-instruct-q4_k_m.gguf";
-   // const char* model_path = (argc >= 2) ? argv[1] : "Phi-3.5-mini-instruct-Q6_K.gguf";
-     const char* model_path = (argc >= 2) ? argv[1] : "DeepSeek-R1-Distill-Qwen-7B-Q2_K_L.gguf";
-    const char* user_prompt = (argc >= 3) ? argv[2] :
-        "";
+    const char* model_path = (argc >= 2) ? argv[1] : "qwen2.5-coder-7b-instruct-q4_k_m.gguf";
+    const char* user_prompt = (argc >= 3) ? argv[2] : "";
+
+    // Fallback if the prompt was left empty or omitted
+    if (user_prompt[0] == '\0') {
+        user_prompt = "Write a secure TCP client in C++";
+    }
 
     printf("=======================================================\n");
     printf(" Running libinfer  Coder\n");
@@ -42,8 +44,9 @@ int main(int argc, char** argv) {
     // 3. Load Qwen2.5-Coder GGUF Model (2048 token context window)
     printf("Loading model weights into memory/GPU...\n");
     if (!infer_load_model(ctx, model_path, 2048)) {
-        fprintf(stderr, "\nFailed to load model '%s':\n%s\n",
-            model_path, infer_get_last_error(ctx));
+        char err_buf[256];
+        infer_get_last_error(ctx, err_buf, sizeof(err_buf));
+        fprintf(stderr, "\nFailed to load model '%s':\n%s\n", model_path, err_buf);
         infer_free(ctx);
         return 1;
     }
@@ -71,7 +74,9 @@ int main(int argc, char** argv) {
     printf("\n\n-------------------------------\n");
 
     if (!success) {
-        fprintf(stderr, "Inference error: %s\n", infer_get_last_error(ctx));
+        char err_buf[256];
+        infer_get_last_error(ctx, err_buf, sizeof(err_buf));
+        fprintf(stderr, "Inference error: %s\n", err_buf);
     }
 
     // 7. Cleanup resources

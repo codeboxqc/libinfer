@@ -27,7 +27,7 @@
 static bool on_token_stream(const char* piece, void* user_data) {
     (void)user_data;
     printf("%s", piece);
-    fflush(stdout); // Real-time terminal output
+    fflush(stdout); // Real-time terminal output[cite: 3]
     return true;
 }
 
@@ -41,22 +41,24 @@ int main(int argc, char** argv) {
     printf(" Commands: /save, /load, /clear, /quit\n");
     printf("=======================================================\n\n");
 
-    // Initialize inference context
+    // Initialize inference context[cite: 3]
     infer_ctx* ctx = infer_init();
     if (!ctx) {
         fprintf(stderr, "Error: Failed to initialize infer context.\n");
         return 1;
     }
 
-    // Load model with 2048 token context window
+    // Load model with 2048 token context window[cite: 3]
     printf("Loading model weights into memory/GPU...\n");
     if (!infer_load_model(ctx, model_path, 2048)) {
-        fprintf(stderr, "\nFailed to load model '%s':\n%s\n", model_path, infer_get_last_error(ctx));
+        char err_buf[256];
+        infer_get_last_error(ctx, err_buf, sizeof(err_buf));
+        fprintf(stderr, "\nFailed to load model '%s':\n%s\n", model_path, err_buf);
         infer_free(ctx);
         return 1;
     }
 
-    // Set sampling parameters
+    // Set sampling parameters[cite: 3]
     infer_sampler_params sparams = infer_sampler_default_params();
     sparams.temperature = 0.60f;
     sparams.top_p = 0.95f;
@@ -87,44 +89,45 @@ int main(int argc, char** argv) {
             break;
         }
         else if (strcmp(input_buffer, "/save") == 0) {
-            if (infer_state_save(ctx, "chat_state.bin")) { // Saves KV Cache & Session State
+            if (infer_state_save(ctx, "chat_state.bin")) {
                 printf("[System: State successfully saved to chat_state.bin]\n");
             }
             else {
-                printf("[System: Save failed - %s]\n", infer_get_last_error(ctx));
+                char err_buf[256];
+                infer_get_last_error(ctx, err_buf, sizeof(err_buf));
+                printf("[System: Save failed - %s]\n", err_buf);
             }
             continue;
         }
         else if (strcmp(input_buffer, "/load") == 0) {
-            if (infer_state_load(ctx, "chat_state.bin")) { // Loads KV Cache & Session State
+            if (infer_state_load(ctx, "chat_state.bin")) {
                 printf("[System: State successfully loaded from chat_state.bin]\n");
                 printf("[System: Current KV tokens restored to: %u]\n", infer_get_kv_cache_token_count(ctx));
             }
             else {
-                printf("[System: Load failed - %s]\n", infer_get_last_error(ctx));
+                char err_buf[256];
+                infer_get_last_error(ctx, err_buf, sizeof(err_buf));
+                printf("[System: Load failed - %s]\n", err_buf);
             }
             continue;
         }
-        else if (strcmp(input_buffer, "/clear") == 0) {
-            infer_memory_clear(ctx); // Clears KV cache
-            printf("[System: Memory cleared. KV tokens: %u]\n", infer_get_kv_cache_token_count(ctx));
-            continue;
-        }
 
-        // Standard user turn: uses infer_generate_chat_turn to persist memory automatically
+        // Standard user turn: uses infer_generate_chat_turn to persist memory automatically[cite: 1]
         printf("AI> ");
         bool success = infer_generate_chat_turn(ctx, "user", input_buffer, on_token_stream, NULL);
         printf("\n");
 
         if (!success) {
-            fprintf(stderr, "\n[Inference error: %s]\n", infer_get_last_error(ctx));
+            char err_buf[256];
+            infer_get_last_error(ctx, err_buf, sizeof(err_buf));
+            fprintf(stderr, "\n[Inference error: %s]\n", err_buf);
         }
 
         // Show live token usage across the conversation[cite: 1]
         printf("[KV cache token count: %u / 2048]\n", infer_get_kv_cache_token_count(ctx));
     }
 
-    // Cleanup resources
+    // Cleanup resources[cite: 3]
     infer_free(ctx);
     printf("Inference context freed successfully.\n");
 
