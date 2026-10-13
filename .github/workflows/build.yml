@@ -21,14 +21,17 @@ jobs:
             name: windows-x64
             ext: dll
             cli: infer_cli.exe
+            use_cuda: true
           - os: ubuntu-latest
             name: linux-x64
             ext: so
             cli: infer_cli
+            use_cuda: true
           - os: macos-latest
             name: macos-arm64
             ext: dylib
             cli: infer_cli
+            use_cuda: false
 
     runs-on: ${{ matrix.os }}
 
@@ -44,13 +47,19 @@ jobs:
         git clone --depth 1 https://github.com/ggerganov/llama.cpp.git third_party/llama.cpp
 
     - name: Install CUDA Toolkit
-      if: runner.os != 'macOS'
+      if: matrix.use_cuda
       uses: Jimver/cuda-toolkit@v0.2.36
       with:
         cuda: '12.4.0'
 
     - name: Configure CMake
-      run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
+      shell: bash
+      run: |
+        EXTRA_FLAGS=""
+        if [ "${{ matrix.use_cuda }}" = "true" ]; then
+          EXTRA_FLAGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75;80;86;89"
+        fi
+        cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF $EXTRA_FLAGS
 
     - name: Build Project
       run: cmake --build build --config Release --parallel 4
@@ -72,6 +81,14 @@ jobs:
         # 4. Gather the C header
         cp include/infer.h staging/
 
+        # 5. On Windows with CUDA: bundle runtime DLLs needed by ggml-cuda.dll
+        if [ "${{ runner.os }}" = "Windows" ] && [ "${{ matrix.use_cuda }}" = "true" ]; then
+          CUDA_BIN="$CUDA_PATH/bin"
+          cp "$CUDA_BIN"/cudart64_*.dll staging/ || true
+          cp "$CUDA_BIN"/cublas64_*.dll staging/ || true
+          cp "$CUDA_BIN"/cublasLt64_*.dll staging/ || true
+        fi
+
     - name: Package Zip
       shell: bash
       run: |
@@ -88,7 +105,6 @@ jobs:
         name: libinfer-${{ matrix.name }}
         path: libinfer-${{ matrix.name }}.zip
 
-  # Dedicated release job prevents matrix collisions
   release:
     needs: build
     runs-on: ubuntu-latest
@@ -99,7 +115,7 @@ jobs:
       uses: actions/download-artifact@v4
       with:
         path: all-binaries
-        merge-multiple: true # Flattens the downloads so all 3 zips sit in the same folder
+        merge-multiple: true
 
     - name: Publish to GitHub Releases
       uses: softprops/action-gh-release@v2
