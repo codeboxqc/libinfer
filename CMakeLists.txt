@@ -17,6 +17,9 @@ set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "Do not build llama.cpp examples" FORCE)
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Do not build llama.cpp tests" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "Do not build llama.cpp server" FORCE)
 
+# Enable CUDA backend in llama.cpp if requested
+option(GGML_CUDA "Enable CUDA backend" OFF)
+
 # Add llama.cpp as third-party dependency
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/CMakeLists.txt")
     message(WARNING "third_party/llama.cpp not found. Run 'git submodule update --init --recursive' before building.")
@@ -57,38 +60,6 @@ target_compile_definitions(infer_core
     PRIVATE
         INFER_BUILD_SHARED
 )
-
-# -----------------------------------------------------------------------------
-# Demonstration: Hardware Backend Module (infer_cuda)
-# Compiles as a runtime-loadable MODULE without direct linkage from infer_core
-# -----------------------------------------------------------------------------
-include(CheckLanguage)
-check_language(CUDA)
-
-if(CMAKE_CUDA_COMPILER AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/src/ggml-cuda.cu")
-    enable_language(CUDA)
-    message(STATUS "CUDA compiler detected: ${CMAKE_CUDA_COMPILER}. Building infer_cuda backend module.")
-
-    add_library(infer_cuda MODULE
-        third_party/llama.cpp/ggml/src/ggml-cuda.cu
-    )
-
-    target_include_directories(infer_cuda PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/include
-    )
-
-    if(TARGET ggml)
-        target_link_libraries(infer_cuda PRIVATE ggml)
-    endif()
-
-    set_target_properties(infer_cuda PROPERTIES
-        CUDA_ARCHITECTURES "all"
-        CUDA_SEPARABLE_COMPILATION ON
-        PREFIX "" # Generates infer_cuda.so / infer_cuda.dll directly
-        OUTPUT_NAME "ggml-cuda" # Matches the ggml-backend-dl discovery scanner
-    )
-endif()
 
 # -----------------------------------------------------------------------------
 # Example CLI target
