@@ -57,7 +57,10 @@ When you build or download `libinfer`, the compilation produces standard platfor
 
 
 <img width="709" height="301" alt="2" src="https://github.com/user-attachments/assets/37afa1bb-3d0f-451d-a063-f79921a6e72b" />
-<img width="632" height="357" alt="Untitled" src="https://github.com/user-attachments/assets/a67eaf35-7197-4278-82db-682f1ee437a8" />
+
+you 9 dll next to your exe!
+<img width="537" height="476" alt="Untitled" src="https://github.com/user-attachments/assets/efe17356-e195-4512-8da3-ddc4e4d34908" />
+
 
 
 ## 🚀 Quick Start Guide
