@@ -594,15 +594,8 @@ static uint32_t calculate_safe_n_ctx(struct llama_model* model, uint32_t request
         return target_ctx;
     }
 
-#if defined(INFER_NO_HEAD_DIM_API)
     int32_t head_dim_k = n_embd / n_head;
     int32_t head_dim_v = head_dim_k;
-#else
-    int32_t head_dim_k = llama_model_n_embd_head_k(model);
-    int32_t head_dim_v = llama_model_n_embd_head_v(model);
-    if (head_dim_k <= 0) head_dim_k = n_embd / n_head;
-    if (head_dim_v <= 0) head_dim_v = n_embd / n_head;
-#endif
 
     constexpr size_t bytes_per_element = 2; // GGML_TYPE_F16
     size_t bytes_per_token = static_cast<size_t>(n_layer) * n_head_kv * (head_dim_k + head_dim_v) * bytes_per_element;
