@@ -69,7 +69,7 @@ int main(int argc, char** argv) {
     printf("\n--- AI Coder Response ---\n\n");
 
     // 6. Run synchronous chat generation with streaming output
-    bool success = infer_generate_chat(ctx, chat, num_msgs, on_token_stream, NULL);
+    bool success = infer_generate_chat(ctx, chat, num_msgs, 0, on_token_stream, NULL);
 
     printf("\n\n-------------------------------\n");
 
