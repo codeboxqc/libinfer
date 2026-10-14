@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
 
     // Initial system prompt to establish behavior (processed without echoing)
     printf("Initializing system prompt...\n");
-    infer_generate_chat_turn(ctx, "system", "You are a helpful AI assistant. Keep responses concise.", on_token_stream, NULL);
+    infer_generate_chat_turn(ctx, "system", "You are a helpful AI assistant. Keep responses concise.", 0, on_token_stream, NULL);
     printf("\n[System initialized. Current KV tokens: %u]\n\n", infer_get_kv_cache_token_count(ctx));
 
     // Simple interactive command loop
@@ -114,7 +114,7 @@ int main(int argc, char** argv) {
 
         // Standard user turn: uses infer_generate_chat_turn to persist memory automatically[cite: 1]
         printf("AI> ");
-        bool success = infer_generate_chat_turn(ctx, "user", input_buffer, on_token_stream, NULL);
+        bool success = infer_generate_chat_turn(ctx, "user", input_buffer, 0, on_token_stream, NULL);
         printf("\n");
 
         if (!success) {
