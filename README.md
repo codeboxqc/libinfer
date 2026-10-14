@@ -187,6 +187,8 @@ int main(int argc, char** argv) {
 
 
 
+
+
 # libinfer API Documentation
 
 **`libinfer`** is a streamlined C/C++ inference engine wrapping `llama.cpp`. It provides hardware-accelerated LLM execution (via CUDA or Metal) with advanced features like persistent KV caching for multi-turn chat, asynchronous generation, grammar constraints, and embedding extraction.
