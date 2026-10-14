@@ -4,6 +4,19 @@
 [![Latest Release](https://img.shields.io/github/v/release/codeboxqc/libinfer?include_prereleases&color=blue)](https://github.com/codeboxqc/libinfer/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+
+libinfer-windows-x64.zip 
+ https://github.com/codeboxqc/libinfer/releases/download/latest/libinfer-windows-x64.zip
+
+ 
+libinfer-macos-arm64.zip
+https://github.com/codeboxqc/libinfer/releases/download/latest/libinfer-macos-arm64.zip
+
+
+ibinfer-linux-x64.zip
+https://github.com/codeboxqc/libinfer/releases/download/latest/libinfer-linux-x64.zip
+
+
 **`libinfer`** is a high-performance, lightweight, cross-platform dynamic inference library for Large Language Models (LLMs) built on top of [`llama.cpp`](https://github.com/ggerganov/llama.cpp). 
 
 It exposes a simple C ABI interface (`infer.h`), making it easy to embed real-time local LLM inference, streaming token callbacks, and context shifting into C, C++, Rust, Python, Go, or GUI applications across **Windows**, **Linux**, and **macOS**.
