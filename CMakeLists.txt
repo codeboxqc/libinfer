@@ -1,38 +1,71 @@
+cmake_minimum_required(VERSION 3.22)
+project(libinfer VERSION 0.1.0 LANGUAGES C CXX)
 
-E:\vcpkg>vcpkg install libinfer --overlay-ports="vcpkg-custom-ports" --head
-Computing installation plan...
-The following packages will be built and installed:
-    libinfer:x64-windows@0.1.0 (+HEAD) -- E:\vcpkg\vcpkg-custom-ports\libinfer
-Installing 1/1 libinfer:x64-windows@0.1.0...
-Building libinfer:x64-windows@0.1.0 from HEAD...
-E:\vcpkg\vcpkg-custom-ports\libinfer: info: installing overlay port from here
-Downloading https://api.github.com/repos/codeboxqc/libinfer/git/refs/heads/main -> codeboxqc-libinfer-main.version
-Successfully downloaded codeboxqc-libinfer-main.version
-Downloading https://github.com/codeboxqc/libinfer/archive/07fc7f9351e0311898e3390bbf99ab09f7e06571.tar.gz -> codeboxqc-libinfer-07fc7f9351e0311898e3390bbf99ab09f7e06571.tar.gz
-Successfully downloaded codeboxqc-libinfer-07fc7f9351e0311898e3390bbf99ab09f7e06571.tar.gz
--- Extracting source E:/vcpkg/downloads/codeboxqc-libinfer-07fc7f9351e0311898e3390bbf99ab09f7e06571.tar.gz
--- Using source at E:/vcpkg/buildtrees/libinfer/src/head/09f7e06571-1ddb43bd55.clean
--- Configuring x64-windows
-CMake Error at scripts/cmake/vcpkg_execute_required_process.cmake:127 (message):
-    Command failed: E:\\vcpkg\\downloads\\tools\\ninja-1.13.2-windows\\ninja.exe -v
-    Working Directory: E:/vcpkg/buildtrees/libinfer/x64-windows-rel/vcpkg-parallel-configure
-    Error code: 1
-    See logs for more information:
-      E:\vcpkg\buildtrees\libinfer\config-x64-windows-dbg-CMakeCache.txt.log
-      E:\vcpkg\buildtrees\libinfer\config-x64-windows-rel-CMakeCache.txt.log
-      E:\vcpkg\buildtrees\libinfer\config-x64-windows-out.log
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-Call Stack (most recent call first):
-  installed/x64-windows/share/vcpkg-cmake/vcpkg_cmake_configure.cmake:271 (vcpkg_execute_required_process)
-  vcpkg-custom-ports/libinfer/portfile.cmake:9 (vcpkg_cmake_configure)
-  scripts/ports.cmake:209 (include)
+# Export compile commands for language servers
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# -----------------------------------------------------------------------------
+# Configuration Flags for llama.cpp Submodule
+# -----------------------------------------------------------------------------
+set(GGML_BACKEND_DL ON CACHE BOOL "Enable dynamic backend loading" FORCE)
+set(BUILD_SHARED_LIBS ON CACHE BOOL "Build shared libraries for backends" FORCE)
+set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "Do not build llama.cpp examples" FORCE)
+set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Do not build llama.cpp tests" FORCE)
+set(LLAMA_BUILD_SERVER OFF CACHE BOOL "Do not build llama.cpp server" FORCE)
 
-error: building libinfer:x64-windows failed with: BUILD_FAILED
-See https://learn.microsoft.com/vcpkg/troubleshoot/build-failures?WT.mc_id=vcpkg_inproduct_cli for more information.
-Elapsed time to handle libinfer:x64-windows: 2.5 s
-Please ensure you're using the latest port files with `git pull` and `vcpkg update`.
-Then check for known issues at:
-  https://github.com/microsoft/vcpkg/issues?q=is%3Aissue+is%3Aopen+in%3Atitle+libinfer
-You can submit a new issue at:
-  https://github.com/microsoft/vcpkg/issues/new?title=%5Blibinfer%5D%20build%20error%20on%20x64-windows&body=Copy%20issue%20body%20from%20E%3A%2Fvcpkg%2Finstalled%2Fvcpkg%2Fissue_body.md
+# Enable CUDA backend in llama.cpp if requested
+option(GGML_CUDA "Enable CUDA backend" OFF)
+
+# Add llama.cpp as third-party dependency
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/CMakeLists.txt")
+    message(WARNING "third_party/llama.cpp not found. Run 'git submodule update --init --recursive' before building.")
+else()
+    add_subdirectory(third_party/llama.cpp EXCLUDE_FROM_ALL)
+endif()
+
+# -----------------------------------------------------------------------------
+# Target: infer_core (Shared ABI Boundary)
+# -----------------------------------------------------------------------------
+add_library(infer_core SHARED
+    src/infer_core.cpp
+)
+
+target_include_directories(infer_core
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/include
+)
+
+if(TARGET llama AND TARGET ggml)
+    target_link_libraries(infer_core PRIVATE llama ggml)
+endif()
+
+# Enforce strict symbol visibility: hide internal symbols by default
+set_target_properties(infer_core PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+    POSITION_INDEPENDENT_CODE ON
+    OUTPUT_NAME "infer"
+)
+
+# Export macro definitions for DLL/SO symbol visibility
+target_compile_definitions(infer_core
+    PRIVATE
+        INFER_BUILD_SHARED
+)
+
+# -----------------------------------------------------------------------------
+# Example CLI target
+# -----------------------------------------------------------------------------
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/main.c")
+    add_executable(infer_cli examples/main.c)
+    target_link_libraries(infer_cli PRIVATE infer_core)
+    target_include_directories(infer_cli PRIVATE include)
+endif()
