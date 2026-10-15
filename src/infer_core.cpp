@@ -1042,6 +1042,12 @@ int32_t read_model_meta_i32(struct llama_model* model, const std::string& key, i
     return fallback;
 }
 
+ 
+
+
+// ============================================================================
+// Replace calculate_safe_n_ctx in infer_core.cpp (inside anonymous namespace)
+// ============================================================================
 uint32_t calculate_safe_n_ctx(
     struct llama_model* model,
     uint32_t requested_ctx,
@@ -1051,8 +1057,8 @@ uint32_t calculate_safe_n_ctx(
 ) {
     uint32_t max_train = static_cast<uint32_t>(llama_model_n_ctx_train(model));
 
-    // Probe total GPU VRAM to auto-select optimal context tier when requested_ctx == 0
     uint64_t total_vram = 0;
+    uint64_t free_vram  = 0;
     size_t dev_count = ggml_backend_dev_count();
     for (size_t i = 0; i < dev_count; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -1061,16 +1067,23 @@ uint32_t calculate_safe_n_ctx(
             size_t dev_free = 0, dev_total = 0;
             ggml_backend_dev_memory(dev, &dev_free, &dev_total);
             total_vram += static_cast<uint64_t>(dev_total);
+            free_vram  += static_cast<uint64_t>(dev_free);
         }
     }
 
-    uint32_t auto_tier_ctx = DEFAULT_FALLBACK_CTX; // 4096 default (for 6 GB GPUs like RTX 2060)
-    if (total_vram == 0 || total_vram <= (4600ULL * 1024ULL * 1024ULL)) {
-        auto_tier_ctx = 2048;  // <= 4 GB VRAM or CPU-only
+    uint64_t free_sys_ram = query_system_free_ram();
+
+    // Auto-select target context from GPU VRAM + System RAM
+    uint32_t auto_tier_ctx = DEFAULT_FALLBACK_CTX; // 4096 default (6 GB GPU)
+    if (total_vram == 0) {
+        // CPU-only mode: scale with System RAM (8192 if >= 16 GB free RAM, else 4096)
+        auto_tier_ctx = (free_sys_ram >= (12000ULL * 1024ULL * 1024ULL)) ? 8192 : 4096;
+    } else if (total_vram <= (4600ULL * 1024ULL * 1024ULL)) {
+        auto_tier_ctx = 2048;  // <= 4 GB GPU
     } else if (total_vram >= (14000ULL * 1024ULL * 1024ULL)) {
-        auto_tier_ctx = 16384; // >= 16 GB VRAM
+        auto_tier_ctx = 16384; // >= 16 GB GPU
     } else if (total_vram >= (7500ULL * 1024ULL * 1024ULL)) {
-        auto_tier_ctx = 8192;  // 8 GB - 12 GB VRAM
+        auto_tier_ctx = 8192;  // 8 GB - 12 GB GPU
     }
 
     uint32_t target_ctx = (requested_ctx > 0) ? requested_ctx : auto_tier_ctx;
@@ -1108,40 +1121,33 @@ uint32_t calculate_safe_n_ctx(
         return target_ctx;
     }
 
-    uint64_t free_mem = 0;
-    if (n_gpu_layers != 0) {
-        for (size_t i = 0; i < dev_count; ++i) {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            auto dtype = ggml_backend_dev_type(dev);
-            if (dtype == GGML_BACKEND_DEVICE_TYPE_GPU || dtype == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                size_t dev_free = 0, dev_total = 0;
-                ggml_backend_dev_memory(dev, &dev_free, &dev_total);
-                free_mem += static_cast<uint64_t>(dev_free);
-            }
-        }
+    // In Hybrid GPU+RAM mode (when n_gpu_layers < n_layer), KV layers on CPU use System RAM!
+    uint64_t usable_pool = (n_gpu_layers != 0) ? free_vram : free_sys_ram;
+    if (n_gpu_layers > 0 && n_gpu_layers < n_layer && free_sys_ram > usable_pool) {
+        // Hybrid offload: KV cache is split between VRAM and System RAM
+        usable_pool += (free_sys_ram / 4);
     }
-
-    if (free_mem == 0) {
-        free_mem = query_system_free_ram();
+    if (usable_pool == 0) {
+        usable_pool = free_sys_ram;
     }
-
-    if (free_mem == 0) {
+    if (usable_pool == 0) {
         return target_ctx;
     }
 
-    // Reserve 450 MiB headroom for compute graph buffer + display VRAM
-    constexpr uint64_t headroom = 450ULL * 1024ULL * 1024ULL;
-    if (free_mem <= headroom) {
-        return std::min<uint32_t>(target_ctx, 1024);
+    constexpr uint64_t headroom = 384ULL * 1024ULL * 1024ULL;
+    if (usable_pool <= headroom) {
+        return std::min<uint32_t>(target_ctx, 2048);
     }
 
-    uint64_t available_mem = free_mem - headroom;
+    uint64_t available_mem = usable_pool - headroom;
     uint64_t max_tokens_64 = available_mem / static_cast<uint64_t>(bytes_per_token);
     uint32_t safe_tokens = (max_tokens_64 > UINT32_MAX) ? UINT32_MAX : static_cast<uint32_t>(max_tokens_64);
 
-    uint32_t floor_ctx = std::min<uint32_t>(target_ctx, 1024);
+    uint32_t floor_ctx = std::min<uint32_t>(target_ctx, 2048);
     return std::max<uint32_t>(floor_ctx, std::min<uint32_t>(target_ctx, safe_tokens));
 }
+
+
 
 template <typename T, typename = void>
 struct has_flash_attn_bool : std::false_type {};
@@ -1919,6 +1925,9 @@ bool infer_unload_model(infer_ctx* ctx) {
     }
 }
 
+
+
+
 bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_params* params) {
     if (!ctx || !path || !params) {
         if (ctx) ctx->set_error("Null path or parameters in infer_load_model_ex.");
@@ -1949,10 +1958,52 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
         std::lock_guard<std::mutex> lock(ctx->ctx_mutex);
         ctx->clear_error();
 
+        // 1. Free old model first so GPU VRAM reading is 100% accurate
         free_model_resources_locked(ctx);
 
+        // 2. Measure GGUF file size on disk and free GPU VRAM for Hybrid GPU + RAM split
+        uint64_t model_file_bytes = 0;
+        {
+            ScopedFile mf(open_file_utf8(path, "rb"));
+            if (mf) {
+                file_size_64(mf.get(), model_file_bytes);
+            }
+        }
+
+        uint64_t free_vram = 0;
+        size_t dev_count = ggml_backend_dev_count();
+        for (size_t i = 0; i < dev_count; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            auto dtype = ggml_backend_dev_type(dev);
+            if (dtype == GGML_BACKEND_DEVICE_TYPE_GPU || dtype == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                size_t df = 0, dt = 0;
+                ggml_backend_dev_memory(dev, &df, &dt);
+                free_vram += static_cast<uint64_t>(df);
+            }
+        }
+
+        int32_t target_gpu_layers = (mparams.n_gpu_layers < 0) ? 999 : mparams.n_gpu_layers;
+
+        // If user requested Auto GPU offload (-1) and model file + 900 MB KV/compute reserve
+        // exceeds free VRAM, automatically split layers between GPU VRAM and System RAM!
+        constexpr uint64_t KV_AND_COMPUTE_VRAM_RESERVE = 900ULL * 1024ULL * 1024ULL;
+        if (mparams.n_gpu_layers < 0 && free_vram > 0 && model_file_bytes > 0) {
+            if (free_vram <= KV_AND_COMPUTE_VRAM_RESERVE) {
+                target_gpu_layers = 0; // Not enough free VRAM; use 32 GB System RAM
+            } else {
+                uint64_t vram_budget_for_weights = free_vram - KV_AND_COMPUTE_VRAM_RESERVE;
+                if (model_file_bytes > vram_budget_for_weights) {
+                    // Estimate total layers (~36 for 7B/8B, ~28 for 3B) and offload exact fitting ratio to GPU
+                    // Remaining layers stay in 32 GB System RAM via mmap!
+                    double fit_ratio = static_cast<double>(vram_budget_for_weights) / static_cast<double>(model_file_bytes);
+                    int32_t est_total_layers = (model_file_bytes > 4800ULL * 1024ULL * 1024ULL) ? 36 : 32;
+                    target_gpu_layers = std::max<int32_t>(1, static_cast<int32_t>(fit_ratio * est_total_layers));
+                }
+            }
+        }
+
         struct llama_model_params llama_mparams = llama_model_default_params();
-        llama_mparams.n_gpu_layers = (mparams.n_gpu_layers < 0) ? 999 : mparams.n_gpu_layers;
+        llama_mparams.n_gpu_layers = target_gpu_layers;
         apply_model_load_params(llama_mparams, mparams.use_mmap, mparams.use_mlock);
 
         std::unique_ptr<llama_model, decltype(&llama_model_free)> new_model(
@@ -2060,6 +2111,9 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
         return false;
     }
 }
+
+
+
 
 bool infer_load_model(infer_ctx* ctx, const char* path, uint32_t requested_ctx) {
     infer_model_params params = infer_model_default_params();
