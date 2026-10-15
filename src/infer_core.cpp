@@ -1011,17 +1011,13 @@ bool infer_has_real_gpu() {
 }
 
 int32_t pick_threads(bool has_gpu, bool batch_phase) {
+    (void)has_gpu;
+    (void)batch_phase;
     if (g_cached_env_threads > 0) {
         return g_cached_env_threads;
     }
     uint32_t phys = (g_cached_phys_cores > 0) ? g_cached_phys_cores : detect_physical_cores();
-    if (phys == 0) phys = 4;
-    if (has_gpu) {
-        return static_cast<int32_t>(
-            batch_phase ? std::min<uint32_t>(phys, 8)
-                        : std::min<uint32_t>(std::max<uint32_t>(1, phys / 2), 4));
-    }
-    return static_cast<int32_t>(phys);
+    return static_cast<int32_t>(phys > 0 ? phys : 4);
 }
 
 enum ggml_type map_kv_type(int32_t kv_type) {
@@ -1974,7 +1970,7 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
             struct llama_context_params ctx_params = llama_context_default_params();
             ctx_params.n_ctx           = candidate_ctx;
             ctx_params.n_batch         = std::min<uint32_t>(candidate_ctx, DEFAULT_BATCH_CAP);
-            ctx_params.n_seq_max       = 2;
+            ctx_params.n_seq_max       = 1;
             ctx_params.kv_unified      = true;
             ctx_params.type_k          = type_k;
             ctx_params.type_v          = type_v;
