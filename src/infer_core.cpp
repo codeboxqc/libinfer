@@ -1,6 +1,5 @@
-
 /* ========================================================================== */
-/* infer_core.cpp - Production Implementation                                 */
+/* infer_core.cpp - Production Implementation (Auto GPU/CPU Scaling)          */
 /* ========================================================================== */
 #include "infer.h"
 
@@ -1051,7 +1050,30 @@ uint32_t calculate_safe_n_ctx(
     enum ggml_type type_v
 ) {
     uint32_t max_train = static_cast<uint32_t>(llama_model_n_ctx_train(model));
-    uint32_t target_ctx = (requested_ctx > 0) ? requested_ctx : DEFAULT_FALLBACK_CTX;
+
+    // Probe total GPU VRAM to auto-select optimal context tier when requested_ctx == 0
+    uint64_t total_vram = 0;
+    size_t dev_count = ggml_backend_dev_count();
+    for (size_t i = 0; i < dev_count; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        auto dtype = ggml_backend_dev_type(dev);
+        if (dtype == GGML_BACKEND_DEVICE_TYPE_GPU || dtype == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            size_t dev_free = 0, dev_total = 0;
+            ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+            total_vram += static_cast<uint64_t>(dev_total);
+        }
+    }
+
+    uint32_t auto_tier_ctx = DEFAULT_FALLBACK_CTX; // 4096 default (for 6 GB GPUs like RTX 2060)
+    if (total_vram == 0 || total_vram <= (4600ULL * 1024ULL * 1024ULL)) {
+        auto_tier_ctx = 2048;  // <= 4 GB VRAM or CPU-only
+    } else if (total_vram >= (14000ULL * 1024ULL * 1024ULL)) {
+        auto_tier_ctx = 16384; // >= 16 GB VRAM
+    } else if (total_vram >= (7500ULL * 1024ULL * 1024ULL)) {
+        auto_tier_ctx = 8192;  // 8 GB - 12 GB VRAM
+    }
+
+    uint32_t target_ctx = (requested_ctx > 0) ? requested_ctx : auto_tier_ctx;
     if (max_train > 0) {
         target_ctx = std::min<uint32_t>(target_ctx, max_train);
     }
@@ -1088,7 +1110,6 @@ uint32_t calculate_safe_n_ctx(
 
     uint64_t free_mem = 0;
     if (n_gpu_layers != 0) {
-        size_t dev_count = ggml_backend_dev_count();
         for (size_t i = 0; i < dev_count; ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             auto dtype = ggml_backend_dev_type(dev);
@@ -1108,16 +1129,17 @@ uint32_t calculate_safe_n_ctx(
         return target_ctx;
     }
 
-    constexpr uint64_t headroom = 256ULL * 1024ULL * 1024ULL;
+    // Reserve 450 MiB headroom for compute graph buffer + display VRAM
+    constexpr uint64_t headroom = 450ULL * 1024ULL * 1024ULL;
     if (free_mem <= headroom) {
-        return std::min<uint32_t>(target_ctx, 512);
+        return std::min<uint32_t>(target_ctx, 1024);
     }
 
     uint64_t available_mem = free_mem - headroom;
     uint64_t max_tokens_64 = available_mem / static_cast<uint64_t>(bytes_per_token);
     uint32_t safe_tokens = (max_tokens_64 > UINT32_MAX) ? UINT32_MAX : static_cast<uint32_t>(max_tokens_64);
 
-    uint32_t floor_ctx = std::min<uint32_t>(target_ctx, 512);
+    uint32_t floor_ctx = std::min<uint32_t>(target_ctx, 1024);
     return std::max<uint32_t>(floor_ctx, std::min<uint32_t>(target_ctx, safe_tokens));
 }
 
@@ -1927,7 +1949,6 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
         std::lock_guard<std::mutex> lock(ctx->ctx_mutex);
         ctx->clear_error();
 
-        // Release old model and KV cache first so VRAM reading is accurate and peak memory is 1x.
         free_model_resources_locked(ctx);
 
         struct llama_model_params llama_mparams = llama_model_default_params();
@@ -2692,12 +2713,7 @@ bool infer_get_embeddings_ex(infer_ctx* ctx, const char* text, float* out_vec, s
             return false;
         }
 
-        const uint64_t chat_used = static_cast<uint64_t>(std::max(0, ctx->n_past.load(std::memory_order_relaxed)));
-        if (static_cast<uint64_t>(tokens.size()) + chat_used > ctx->n_ctx) {
-            ctx->set_error("Input text exceeds free context capacity for embedding generation "
-                           "(chat KV shares the pool; call infer_memory_clear to free it).");
-            return false;
-        }
+        invalidate_kv(ctx);
 
         const int effective_batch_cap = std::min<int>(DEFAULT_BATCH_CAP, static_cast<int>(llama_n_batch(ctx->lctx)));
         if (tokens.size() > static_cast<size_t>(effective_batch_cap) &&
@@ -2711,7 +2727,7 @@ bool infer_get_embeddings_ex(infer_ctx* ctx, const char* text, float* out_vec, s
             infer_ctx* c;
             ~EmbeddingModeGuard() {
                 llama_set_embeddings(c->lctx, false);
-                safe_kv_seq_rm(c, 1, -1, -1);
+                invalidate_kv(c);
             }
         } embd_guard{ctx};
 
@@ -2735,7 +2751,7 @@ bool infer_get_embeddings_ex(infer_ctx* ctx, const char* text, float* out_vec, s
                 batch.token[j]     = tokens[idx];
                 batch.pos[j]       = static_cast<llama_pos>(idx);
                 batch.n_seq_id[j]  = 1;
-                batch.seq_id[j][0] = 1;
+                batch.seq_id[j][0] = 0;
                 batch.logits[j]    = (idx == tokens.size() - 1);
                 batch.n_tokens++;
             }
@@ -2748,7 +2764,7 @@ bool infer_get_embeddings_ex(infer_ctx* ctx, const char* text, float* out_vec, s
             i += static_cast<size_t>(chunk);
         }
 
-        const float* embd = llama_get_embeddings_seq(ctx->lctx, 1);
+        const float* embd = llama_get_embeddings_seq(ctx->lctx, 0);
         if (!embd) embd = llama_get_embeddings_ith(ctx->lctx, -1);
         if (!embd) embd = llama_get_embeddings(ctx->lctx);
 
@@ -3112,7 +3128,7 @@ bool infer_generate_chat_turn_v2(
         };
 
         auto find_next_turn_boundary = [&](size_t start_idx) -> size_t {
-            const size_t limit = ctx->chat_history.size() - 1; // Never prune the newly appended message
+            const size_t limit = ctx->chat_history.size() - 1;
             if (start_idx >= limit) return start_idx;
             size_t end_idx = start_idx + 1;
             while (end_idx < limit && ctx->chat_history[end_idx].role != "user") {
@@ -3153,7 +3169,6 @@ bool infer_generate_chat_turn_v2(
                 std::string generated_response;
                 bool res = execute_decode(ctx, prompt_tokens, true, max_tokens, callback, user_data, &generated_response);
 
-                // Keep user turn in history once prefilled into KV cache so history and KV stay synchronized.
                 if (res || ctx->n_past.load(std::memory_order_relaxed) > prev_past) {
                     hist_guard.armed = false;
                 }
