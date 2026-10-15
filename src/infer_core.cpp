@@ -1,3 +1,4 @@
+
 /* ========================================================================== */
 /* infer_core.cpp - Production Implementation                                 */
 /* ========================================================================== */
@@ -1136,15 +1137,56 @@ struct has_flash_attn_type : std::false_type {};
 template <typename T>
 struct has_flash_attn_type<T, std::void_t<decltype(std::declval<T&>().flash_attn_type)>> : std::true_type {};
 
-void apply_flash_attn_param(struct llama_context_params& ctx_params, bool enable) {
-    if constexpr (has_flash_attn_bool<struct llama_context_params>::value) {
+template <typename CtxParams = struct llama_context_params>
+void apply_flash_attn_param(CtxParams& ctx_params, bool enable) {
+    if constexpr (has_flash_attn_bool<CtxParams>::value) {
         ctx_params.flash_attn = enable;
-    } else if constexpr (has_flash_attn_type<struct llama_context_params>::value) {
+    } else if constexpr (has_flash_attn_type<CtxParams>::value) {
         using FaEnum = decltype(ctx_params.flash_attn_type);
         ctx_params.flash_attn_type = static_cast<FaEnum>(enable ? 1 : 0);
     } else {
         (void)ctx_params;
         (void)enable;
+    }
+}
+
+template <typename T, typename = void>
+struct has_model_use_mmap : std::false_type {};
+
+template <typename T>
+struct has_model_use_mmap<T, std::void_t<decltype(std::declval<T&>().use_mmap = true)>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_model_use_mlock : std::false_type {};
+
+template <typename T>
+struct has_model_use_mlock<T, std::void_t<decltype(std::declval<T&>().use_mlock = true)>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_model_load_mode : std::false_type {};
+
+template <typename T>
+struct has_model_load_mode<T, std::void_t<decltype(std::declval<T&>().load_mode)>> : std::true_type {};
+
+template <typename ModelParams = struct llama_model_params>
+void apply_model_load_params(ModelParams& llama_mparams, bool use_mmap, bool use_mlock) {
+    if constexpr (has_model_use_mmap<ModelParams>::value) {
+        llama_mparams.use_mmap = use_mmap;
+    }
+    if constexpr (has_model_use_mlock<ModelParams>::value) {
+        llama_mparams.use_mlock = use_mlock;
+    }
+    if constexpr (has_model_load_mode<ModelParams>::value) {
+        using ModeEnum = decltype(llama_mparams.load_mode);
+        if (use_mmap && use_mlock) {
+            llama_mparams.load_mode = static_cast<ModeEnum>(3); // LLAMA_LOAD_MODE_MMAP_MLOCK
+        } else if (use_mlock) {
+            llama_mparams.load_mode = static_cast<ModeEnum>(2); // LLAMA_LOAD_MODE_MLOCK
+        } else if (use_mmap) {
+            llama_mparams.load_mode = static_cast<ModeEnum>(1); // LLAMA_LOAD_MODE_MMAP
+        } else {
+            llama_mparams.load_mode = static_cast<ModeEnum>(0); // LLAMA_LOAD_MODE_NONE
+        }
     }
 }
 
@@ -1894,8 +1936,7 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
 
         struct llama_model_params llama_mparams = llama_model_default_params();
         llama_mparams.n_gpu_layers = (mparams.n_gpu_layers < 0) ? 999 : mparams.n_gpu_layers;
-        llama_mparams.use_mmap     = mparams.use_mmap;
-        llama_mparams.use_mlock    = mparams.use_mlock;
+        apply_model_load_params(llama_mparams, mparams.use_mmap, mparams.use_mlock);
 
         std::unique_ptr<llama_model, decltype(&llama_model_free)> new_model(
             llama_model_load_from_file(path, llama_mparams), &llama_model_free);
