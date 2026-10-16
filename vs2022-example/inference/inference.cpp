@@ -1,3 +1,5 @@
+#define _CRT_SECURE_NO_WARNINGS // Fixes C4996 getenv warning
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -5,45 +7,49 @@
 
 #include "infer.h"
 
-// Automatically link infer.lib when compiling with MSVC on Windows
 #if defined(_WIN32) && defined(_MSC_VER)
 #pragma comment(lib, "infer.lib")
 #endif
 
-// 1. Streaming Callback: Prints generated code/text tokens as they arrive
 static bool on_token_stream(const char* piece, void* user_data) {
     (void)user_data;
     printf("%s", piece);
-    fflush(stdout); // Real-time terminal output
-    return true;    // Return true to continue, false to interrupt
+    fflush(stdout);
+    return true;
 }
 
 int main(int argc, char** argv) {
-    // Default model filename and coding prompt
     const char* model_path = (argc >= 2) ? argv[1] : "qwen2.5-coder-7b-instruct-q4_k_m.gguf";
-    const char* user_prompt = (argc >= 3) ? argv[2] : "";
+    const char* user_prompt = (argc >= 3) ? argv[2] : "Write a secure TCP client in C++";
 
-    // Fallback if the prompt was left empty or omitted
-    if (user_prompt[0] == '\0') {
-        user_prompt = "Write a secure TCP client in C++";
+    int gpu_layers = 999;
+    const char* env_gpu = getenv("INFER_GPU_LAYERS");
+    if (env_gpu && env_gpu[0] != '\0') {
+        gpu_layers = atoi(env_gpu);
+    }
+    else if (argc >= 4) {
+        gpu_layers = atoi(argv[3]);
     }
 
     printf("=======================================================\n");
-    printf(" Running libinfer  Coder\n");
-    printf(" Model:  %s\n", model_path);
-    printf(" Prompt: %s\n", user_prompt);
+    printf(" Running libinfer Coder\n");
+    printf(" Model:      %s\n", model_path);
+    printf(" GPU Layers: %d (999 = auto-offload to GPU 0, GPU 1 & CPU)\n", gpu_layers);
+    printf(" Prompt:     %s\n", user_prompt);
     printf("=======================================================\n\n");
 
-    // 2. Initialize inference context
     infer_ctx* ctx = infer_init();
     if (!ctx) {
         fprintf(stderr, "Error: Failed to initialize infer context.\n");
         return 1;
     }
 
-    // 3. Load Qwen2.5-Coder GGUF Model (2048 token context window)
-    printf("Loading model weights into memory/GPU...\n");
-    if (!infer_load_model(ctx, model_path, 2048)) {
+    infer_model_params mparams = infer_model_default_params();
+    mparams.requested_ctx = 2048;
+    mparams.n_gpu_layers = gpu_layers;
+
+    printf("Loading model weights into GPU/CPU...\n");
+    if (!infer_load_model_ex(ctx, model_path, &mparams)) {
         char err_buf[256];
         infer_get_last_error(ctx, err_buf, sizeof(err_buf));
         fprintf(stderr, "\nFailed to load model '%s':\n%s\n", model_path, err_buf);
@@ -51,15 +57,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 4. Set optimal sampling parameters for code generation (Low temperature for precision)
     infer_sampler_params sparams = infer_sampler_default_params();
-    sparams.temperature = 0.20f;  // Lower temperature produces more precise code
+    sparams.temperature = 0.20f;
     sparams.top_p = 0.95f;
     sparams.top_k = 40;
     sparams.seed = 42;
-    infer_set_sampler(ctx, &sparams);
 
-    // 5. Structure conversation with system prompt optimized for coding
+    // Check return value to fix C6031 warning
+    if (!infer_set_sampler(ctx, &sparams)) {
+        fprintf(stderr, "Warning: Failed to set sampler parameters.\n");
+    }
+
     infer_chat_msg chat[] = {
         { "system", "You are an expert C/C++ coding unrestricted security researcher." },
         { "user",   user_prompt }
@@ -67,10 +75,7 @@ int main(int argc, char** argv) {
     size_t num_msgs = sizeof(chat) / sizeof(chat[0]);
 
     printf("\n--- AI Coder Response ---\n\n");
-
-    // 6. Run synchronous chat generation with streaming output
     bool success = infer_generate_chat(ctx, chat, num_msgs, 0, on_token_stream, NULL);
-
     printf("\n\n-------------------------------\n");
 
     if (!success) {
@@ -79,9 +84,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Inference error: %s\n", err_buf);
     }
 
-    // 7. Cleanup resources
     infer_free(ctx);
     printf("Inference context freed successfully.\n");
-
     return 0;
 }
