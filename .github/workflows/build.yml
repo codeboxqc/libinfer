@@ -87,8 +87,8 @@ jobs:
     - name: Stage Artifacts
       shell: bash
       run: |
-        mkdir -p staging/backends/cuda
-        mkdir -p staging/backends/vulkan
+        mkdir -p staging/cuda
+        mkdir -p staging/vulkan
 
         # 1. Gather main shared core libraries & executables into staging root
         find build -maxdepth 2 -name "*infer*.${{ matrix.ext }}" -exec cp {} staging/ \;
@@ -99,20 +99,20 @@ jobs:
         # 2. Move CPU backend to staging root
         find build -name "*ggml-cpu*" -exec cp {} staging/ \;
 
-        # 3. Copy CUDA backend and runtime libraries into backends/cuda/
+        # 3. Copy CUDA backend and runtime libraries into cuda/
         if [ "${{ matrix.use_cuda }}" = "true" ]; then
-          find build -name "*ggml-cuda*" -exec cp {} staging/backends/cuda/ \;
+          find build -name "*ggml-cuda*" -exec cp {} staging/cuda/ \;
           if [ "${{ runner.os }}" = "Windows" ]; then
             CUDA_BIN="$CUDA_PATH/bin"
-            cp "$CUDA_BIN"/cudart64_*.dll staging/backends/cuda/ || true
-            cp "$CUDA_BIN"/cublas64_*.dll staging/backends/cuda/ || true
-            cp "$CUDA_BIN"/cublasLt64_*.dll staging/backends/cuda/ || true
+            cp "$CUDA_BIN"/cudart64_*.dll staging/cuda/ || true
+            cp "$CUDA_BIN"/cublas64_*.dll staging/cuda/ || true
+            cp "$CUDA_BIN"/cublasLt64_*.dll staging/cuda/ || true
           fi
         fi
 
-        # 4. Copy Vulkan backend libraries into backends/vulkan/
+        # 4. Copy Vulkan backend libraries into vulkan/
         if [ "${{ matrix.use_vulkan }}" = "true" ]; then
-          find build -name "*ggml-vulkan*" -exec cp {} staging/backends/vulkan/ \;
+          find build -name "*ggml-vulkan*" -exec cp {} staging/vulkan/ \;
         fi
 
     - name: Package Zip
