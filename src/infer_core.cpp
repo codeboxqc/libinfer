@@ -209,7 +209,7 @@ void add_to_dll_path(const std::string& path) {
     ggml_backend_load_all_from_path(path.c_str());
 }
 
-bool ref_llama_backend(std::string& err_out) {
+ bool ref_llama_backend(std::string& err_out) {
     std::lock_guard<std::mutex> lock(g_backend_mutex);
     if (g_backend_ref_count == 0) {
         const char* single_inst = std::getenv("INFER_SINGLE_INSTANCE");
@@ -282,13 +282,10 @@ bool ref_llama_backend(std::string& err_out) {
         // 1. Scan root executable directory
         add_to_dll_path(dir);
 
-        // 2. Scan subdirectories (cuda/, vulkan/, backends/cuda/, backends/vulkan/)
+        // 2. Scan subdirectories (cuda/, vulkan/)
         static const char* const subdirs[] = {
             "/cuda",
-            "/vulkan",
-            "/backends/cuda",
-            "/backends/vulkan",
-            "/backends"
+            "/vulkan"
         };
 
         for (const char* sub : subdirs) {
