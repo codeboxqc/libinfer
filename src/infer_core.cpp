@@ -180,6 +180,32 @@ bool get_module_dir_utf8(std::string& out) {
 #endif
 }
 
+ 
+
+
+namespace {
+
+// Helper function to safely load backend DLLs from a specific directory path
+void load_backends_from_directory_path(const std::string& path) {
+#if defined(_WIN32)
+    // Add path to Windows DLL search directory so LoadLibrary can resolve CUDA runtime DLLs
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    if (wlen > 0) {
+        std::vector<wchar_t> wbuf(static_cast<size_t>(wlen));
+        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wbuf.data(), wlen);
+        SetDllDirectoryW(wbuf.data());
+    }
+#endif
+
+    // Ask ggml to load all backend dynamic libraries in this path
+    ggml_backend_load_all_from_path(path.c_str());
+
+#if defined(_WIN32)
+    // Restore default Windows DLL search directory
+    SetDllDirectoryW(nullptr);
+#endif
+}
+
 bool ref_llama_backend(std::string& err_out) {
     std::lock_guard<std::mutex> lock(g_backend_mutex);
     if (g_backend_ref_count == 0) {
@@ -249,12 +275,33 @@ bool ref_llama_backend(std::string& err_out) {
             err_out = "Failed to resolve module directory for backend initialization.";
             return false;
         }
-        ggml_backend_load_all_from_path(dir.c_str());
+
+        // 1. Scan root executable directory
+        load_backends_from_directory_path(dir);
+
+        // 2. Scan subdirectories (cuda/, vulkan/, backends/cuda/, backends/vulkan/)
+        static const char* const subdirs[] = {
+            "/cuda",
+            "/vulkan",
+            "/backends/cuda",
+            "/backends/vulkan",
+            "/backends"
+        };
+
+        for (const char* sub : subdirs) {
+            std::string subpath = dir + sub;
+            load_backends_from_directory_path(subpath);
+        }
+
         llama_backend_init();
     }
     g_backend_ref_count++;
     return true;
 }
+
+} // anonymous namespace
+
+
 
 void unref_llama_backend() {
     std::lock_guard<std::mutex> lock(g_backend_mutex);
