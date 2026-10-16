@@ -90,16 +90,13 @@ jobs:
         mkdir -p staging/cuda
         mkdir -p staging/vulkan
 
-        # 1. Gather main shared core libraries & executables into staging root
-        find build -maxdepth 2 -name "*infer*.${{ matrix.ext }}" -exec cp {} staging/ \;
+        # 1. Copy ALL root dynamic libraries (infer.dll, llama.dll, ggml.dll, ggml-cpu.dll) and EXEs
+        find build -name "*.${{ matrix.ext }}" ! -name "*ggml-cuda*" ! -name "*ggml-vulkan*" -exec cp {} staging/ \;
         find build -maxdepth 2 -name "*.lib" -exec cp {} staging/ \;
         find build -maxdepth 2 -name "${{ matrix.cli }}" -type f -exec cp {} staging/ \;
         cp include/infer.h staging/ 2>/dev/null || true
 
-        # 2. Move CPU backend to staging root
-        find build -name "*ggml-cpu*" -exec cp {} staging/ \;
-
-        # 3. Copy CUDA backend and runtime libraries into cuda/
+        # 2. Copy CUDA backend dynamic library and CUDA runtimes into cuda/
         if [ "${{ matrix.use_cuda }}" = "true" ]; then
           find build -name "*ggml-cuda*" -exec cp {} staging/cuda/ \;
           if [ "${{ runner.os }}" = "Windows" ]; then
@@ -110,7 +107,7 @@ jobs:
           fi
         fi
 
-        # 4. Copy Vulkan backend libraries into vulkan/
+        # 3. Copy Vulkan backend into vulkan/
         if [ "${{ matrix.use_vulkan }}" = "true" ]; then
           find build -name "*ggml-vulkan*" -exec cp {} staging/vulkan/ \;
         fi
