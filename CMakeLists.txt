@@ -17,10 +17,10 @@ set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "Do not build llama.cpp examples" FORCE)
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Do not build llama.cpp tests" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "Do not build llama.cpp server" FORCE)
 
-# Enable CUDA backend in llama.cpp if requested
+# Enable CUDA backend in llama.cpp
 option(GGML_CUDA "Enable CUDA backend" OFF)
 
-# Enable Vulkan backend in llama.cpp if requested (For Intel/AMD GPUs)
+# Enable Vulkan backend in llama.cpp
 option(GGML_VULKAN "Enable Vulkan backend" OFF)
 
 # Add llama.cpp as third-party dependency
