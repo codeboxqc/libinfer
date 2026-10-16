@@ -12,7 +12,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Configuration Flags for llama.cpp Submodule
 # -----------------------------------------------------------------------------
 set(GGML_BACKEND_DL ON CACHE BOOL "Enable dynamic backend loading" FORCE)
-set(BUILD_SHARED_LIBS ON CACHE BOOL "Build shared libraries for backends" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static core libraries embedded into infer.dll" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "Do not build llama.cpp examples" FORCE)
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Do not build llama.cpp tests" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "Do not build llama.cpp server" FORCE)
