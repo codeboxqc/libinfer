@@ -17,21 +17,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Windows builds both CUDA and Vulkan
           - os: windows-2022
             name: windows-x64
             ext: dll
             cli: infer_cli.exe
             use_cuda: true
             use_vulkan: true
-          # Linux builds both CUDA and Vulkan
           - os: ubuntu-latest
             name: linux-x64
             ext: so
             cli: infer_cli
             use_cuda: true
             use_vulkan: true
-          # macOS uses native Metal
           - os: macos-latest
             name: macos-arm64
             ext: dylib
