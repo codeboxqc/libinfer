@@ -20,6 +20,9 @@ set(LLAMA_BUILD_SERVER OFF CACHE BOOL "Do not build llama.cpp server" FORCE)
 # Enable CUDA backend in llama.cpp if requested
 option(GGML_CUDA "Enable CUDA backend" OFF)
 
+# Enable Vulkan backend in llama.cpp if requested (For Intel/AMD GPUs)
+option(GGML_VULKAN "Enable Vulkan backend" OFF)
+
 # Add llama.cpp as third-party dependency
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/CMakeLists.txt")
     message(WARNING "third_party/llama.cpp not found. Run 'git submodule update --init --recursive' before building.")
