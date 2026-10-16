@@ -183,12 +183,21 @@ bool get_module_dir_utf8(std::string& out) {
  
 
 
-namespace {
+ namespace {
 
-// Helper function to safely load backend DLLs from a specific directory path
-void load_backends_from_directory_path(const std::string& path) {
+void add_to_dll_path(const std::string& path) {
 #if defined(_WIN32)
-    // Add path to Windows DLL search directory so LoadLibrary can resolve CUDA runtime DLLs
+    // 1. Add directory to process PATH environment variable (for cuBLAS/Vulkan delayed DLL loading)
+    char orig_path[32768] = {};
+    DWORD len = GetEnvironmentVariableA("PATH", orig_path, sizeof(orig_path));
+    if (len > 0 && len < sizeof(orig_path)) {
+        std::string new_path = path + ";" + std::string(orig_path);
+        SetEnvironmentVariableA("PATH", new_path.c_str());
+    } else {
+        SetEnvironmentVariableA("PATH", path.c_str());
+    }
+
+    // 2. Add directory to process DLL search path
     int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
     if (wlen > 0) {
         std::vector<wchar_t> wbuf(static_cast<size_t>(wlen));
@@ -197,13 +206,7 @@ void load_backends_from_directory_path(const std::string& path) {
     }
 #endif
 
-    // Ask ggml to load all backend dynamic libraries in this path
     ggml_backend_load_all_from_path(path.c_str());
-
-#if defined(_WIN32)
-    // Restore default Windows DLL search directory
-    SetDllDirectoryW(nullptr);
-#endif
 }
 
 bool ref_llama_backend(std::string& err_out) {
@@ -277,7 +280,7 @@ bool ref_llama_backend(std::string& err_out) {
         }
 
         // 1. Scan root executable directory
-        load_backends_from_directory_path(dir);
+        add_to_dll_path(dir);
 
         // 2. Scan subdirectories (cuda/, vulkan/, backends/cuda/, backends/vulkan/)
         static const char* const subdirs[] = {
@@ -290,7 +293,7 @@ bool ref_llama_backend(std::string& err_out) {
 
         for (const char* sub : subdirs) {
             std::string subpath = dir + sub;
-            load_backends_from_directory_path(subpath);
+            add_to_dll_path(subpath);
         }
 
         llama_backend_init();
