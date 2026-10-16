@@ -17,10 +17,10 @@ set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "Do not build llama.cpp examples" FORCE)
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Do not build llama.cpp tests" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "Do not build llama.cpp server" FORCE)
 
-# Enable CUDA backend in llama.cpp
+# Enable CUDA backend in llama.cpp if requested
 option(GGML_CUDA "Enable CUDA backend" OFF)
 
-# Enable Vulkan backend in llama.cpp
+# Enable Vulkan backend in llama.cpp if requested (For Intel/AMD/NVIDIA GPUs)
 option(GGML_VULKAN "Enable Vulkan backend" OFF)
 
 # Add llama.cpp as third-party dependency
@@ -48,6 +48,11 @@ target_include_directories(infer_core
 
 if(TARGET llama AND TARGET ggml)
     target_link_libraries(infer_core PRIVATE llama ggml)
+endif()
+
+# Link DXGI on Windows for automatic GPU hardware detection
+if(WIN32)
+    target_link_libraries(infer_core PRIVATE dxgi)
 endif()
 
 # Enforce strict symbol visibility: hide internal symbols by default
