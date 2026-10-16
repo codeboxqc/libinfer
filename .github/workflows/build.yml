@@ -1,4 +1,4 @@
-name: Build libinfer (Cross-Platform)
+name: Build libinfer (Cross-Platform Dual CUDA + Vulkan)
 
 on:
   push:
@@ -17,23 +17,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Windows uses Vulkan for universal multi-GPU pooling (NVIDIA + Intel + AMD)
+          # Windows builds both CUDA and Vulkan
           - os: windows-2022
             name: windows-x64
             ext: dll
             cli: infer_cli.exe
+            use_cuda: true
             use_vulkan: true
-          # Linux uses Vulkan
+          # Linux builds both CUDA and Vulkan
           - os: ubuntu-latest
             name: linux-x64
             ext: so
             cli: infer_cli
+            use_cuda: true
             use_vulkan: true
-          # macOS uses native Metal (no Vulkan required)
+          # macOS uses native Metal
           - os: macos-latest
             name: macos-arm64
             ext: dylib
             cli: infer_cli
+            use_cuda: false
             use_vulkan: false
 
     runs-on: ${{ matrix.os }}
@@ -48,6 +51,12 @@ jobs:
         rm -rf third_party/llama.cpp
         mkdir -p third_party
         git clone --depth 1 https://github.com/ggerganov/llama.cpp.git third_party/llama.cpp
+
+    - name: Install CUDA Toolkit
+      if: matrix.use_cuda
+      uses: Jimver/cuda-toolkit@v0.2.36
+      with:
+        cuda: '12.4.0'
 
     - name: Install Vulkan SDK
       if: matrix.use_vulkan
@@ -67,10 +76,12 @@ jobs:
       shell: bash
       run: |
         EXTRA_FLAGS=""
-        if [ "${{ matrix.use_vulkan }}" = "true" ]; then
-          EXTRA_FLAGS="-DGGML_VULKAN=ON"
+        if [ "${{ matrix.use_cuda }}" = "true" ]; then
+          EXTRA_FLAGS="$EXTRA_FLAGS -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75;80;86;89"
         fi
-        # Compile with Vulkan ONLY for safe Multi-Vendor GPU pooling (Disables duplicate CUDA backend)
+        if [ "${{ matrix.use_vulkan }}" = "true" ]; then
+          EXTRA_FLAGS="$EXTRA_FLAGS -DGGML_VULKAN=ON"
+        fi
         cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF $EXTRA_FLAGS
 
     - name: Build Project
@@ -79,19 +90,33 @@ jobs:
     - name: Stage Artifacts
       shell: bash
       run: |
-        mkdir -p staging
-        
-        # 1. Gather all compiled shared libraries (dll, so, dylib)
-        find build -name "*.${{ matrix.ext }}" -exec cp {} staging/ \;
-        
-        # 2. Gather all compiled static link libraries (.lib files for Windows MSVC)
-        find build -name "*.lib" -exec cp {} staging/ \;
-        
-        # 3. Gather the CLI executable
-        find build -name "${{ matrix.cli }}" -type f -exec cp {} staging/ \;
-        
-        # 4. Gather the C header
-        cp include/infer.h staging/
+        mkdir -p staging/backends/cuda
+        mkdir -p staging/backends/vulkan
+
+        # 1. Gather main shared core libraries & executables into staging root
+        find build -maxdepth 2 -name "*infer*.${{ matrix.ext }}" -exec cp {} staging/ \;
+        find build -maxdepth 2 -name "*.lib" -exec cp {} staging/ \;
+        find build -maxdepth 2 -name "${{ matrix.cli }}" -type f -exec cp {} staging/ \;
+        cp include/infer.h staging/ 2>/dev/null || true
+
+        # 2. Move CPU backend to staging root
+        find build -name "*ggml-cpu*" -exec cp {} staging/ \;
+
+        # 3. Copy CUDA backend and runtime libraries into backends/cuda/
+        if [ "${{ matrix.use_cuda }}" = "true" ]; then
+          find build -name "*ggml-cuda*" -exec cp {} staging/backends/cuda/ \;
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            CUDA_BIN="$CUDA_PATH/bin"
+            cp "$CUDA_BIN"/cudart64_*.dll staging/backends/cuda/ || true
+            cp "$CUDA_BIN"/cublas64_*.dll staging/backends/cuda/ || true
+            cp "$CUDA_BIN"/cublasLt64_*.dll staging/backends/cuda/ || true
+          fi
+        fi
+
+        # 4. Copy Vulkan backend libraries into backends/vulkan/
+        if [ "${{ matrix.use_vulkan }}" = "true" ]; then
+          find build -name "*ggml-vulkan*" -exec cp {} staging/backends/vulkan/ \;
+        fi
 
     - name: Package Zip
       shell: bash
