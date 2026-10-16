@@ -1984,19 +1984,18 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
 
         int32_t target_gpu_layers = (mparams.n_gpu_layers < 0) ? 999 : mparams.n_gpu_layers;
 
-        // If user requested Auto GPU offload (-1) and model file + 900 MB KV/compute reserve
-        // exceeds free VRAM, automatically split layers between GPU VRAM and System RAM!
-        constexpr uint64_t KV_AND_COMPUTE_VRAM_RESERVE = 900ULL * 1024ULL * 1024ULL;
+        // INCREASED RESERVE: Prevents Windows WDDM from paging VRAM to system RAM (which causes the freeze)
+        constexpr uint64_t KV_AND_COMPUTE_VRAM_RESERVE = 1536ULL * 1024ULL * 1024ULL; // 1.5 GB reserve
+        
         if (mparams.n_gpu_layers < 0 && free_vram > 0 && model_file_bytes > 0) {
             if (free_vram <= KV_AND_COMPUTE_VRAM_RESERVE) {
-                target_gpu_layers = 0; // Not enough free VRAM; use 32 GB System RAM
+                target_gpu_layers = 0; // Not enough free VRAM; safely fall back to CPU/System RAM
             } else {
                 uint64_t vram_budget_for_weights = free_vram - KV_AND_COMPUTE_VRAM_RESERVE;
                 if (model_file_bytes > vram_budget_for_weights) {
-                    // Estimate total layers (~36 for 7B/8B, ~28 for 3B) and offload exact fitting ratio to GPU
-                    // Remaining layers stay in 32 GB System RAM via mmap!
                     double fit_ratio = static_cast<double>(vram_budget_for_weights) / static_cast<double>(model_file_bytes);
-                    int32_t est_total_layers = (model_file_bytes > 4800ULL * 1024ULL * 1024ULL) ? 36 : 32;
+                    // FIXED ESTIMATE: Llama 3.2 3B has 28 layers. Overestimating pushes too much to GPU.
+                    int32_t est_total_layers = (model_file_bytes > 4800ULL * 1024ULL * 1024ULL) ? 32 : 28;
                     target_gpu_layers = std::max<int32_t>(1, static_cast<int32_t>(fit_ratio * est_total_layers));
                 }
             }
