@@ -49,11 +49,11 @@ jobs:
         mkdir -p third_party
         git clone --depth 1 https://github.com/ggerganov/llama.cpp.git third_party/llama.cpp
 
-    - name: Install Vulkan SDK (For Intel/AMD/NVIDIA Universal Support)
+    - name: Install Vulkan SDK
       if: matrix.use_vulkan
-      uses: humbletim/install-vulkan-sdk@v1.2
+      uses: jakoch/install-vulkan-sdk-action@v1
       with:
-        version: latest
+        install_runtime: true
         cache: true
 
     - name: Setup Ninja (For faster, reliable builds)
