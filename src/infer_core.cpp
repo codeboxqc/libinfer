@@ -1,5 +1,5 @@
 /* ========================================================================== */
-/* infer_core.cpp - Production Implementation (Auto GPU/CPU Scaling)          */
+/* infer_core.cpp (v2.2.0 - Production Implementation)                       */
 /* ========================================================================== */
 #include "infer.h"
 
@@ -8,7 +8,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <climits>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -22,7 +21,6 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -37,120 +35,31 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#if defined(__APPLE__)
-#include <sys/sysctl.h>
-#include <mach/mach.h>
-#endif
 #endif
 
 namespace {
 
 constexpr uint32_t STATE_MAGIC          = 0x494E4655; // "INFU"
-constexpr uint32_t STATE_VERSION        = 3;          // Version 3 header with full-file CRC & history
+constexpr uint32_t STATE_VERSION        = 3;          // Version 3 header with CRC & history
 constexpr uint32_t DEFAULT_BATCH_CAP    = 512;
 constexpr uint32_t DEFAULT_FALLBACK_CTX = 4096;
-constexpr uint64_t MAX_STATE_FILE_SIZE  = 64ULL * 1024ULL * 1024ULL * 1024ULL; // 64 GiB bound
+constexpr size_t   MAX_STATE_FILE_SIZE  = 64ULL * 1024ULL * 1024ULL * 1024ULL; // 64GB bound
 
 std::mutex g_backend_mutex;
 int32_t    g_backend_ref_count = 0;
-int32_t    g_cached_env_threads = 0;
-uint32_t   g_cached_phys_cores  = 0;
 
 infer_log_cb g_user_log_cb   = nullptr;
 void*        g_user_log_data = nullptr;
 std::mutex   g_log_mutex;
 
+
 #if defined(_WIN32)
-HANDLE g_instance_mutex = NULL;
+static HANDLE g_instance_mutex = NULL;
 #else
-int g_instance_fd = -1;
+static int g_instance_fd = -1;
 #endif
 
-uint32_t detect_physical_cores() {
-#if defined(_WIN32)
-    DWORD length = 0;
-    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
-    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && length > 0) {
-        std::vector<uint8_t> buffer(length);
-        auto* info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data());
-        if (GetLogicalProcessorInformationEx(RelationProcessorCore, info, &length)) {
-            uint32_t cores = 0;
-            DWORD offset = 0;
-            while (offset < length) {
-                auto* current = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data() + offset);
-                if (current->Relationship == RelationProcessorCore) {
-                    cores++;
-                }
-                if (current->Size == 0) break;
-                offset += current->Size;
-            }
-            if (cores > 0) return cores;
-        }
-    }
-#elif defined(__APPLE__)
-    int32_t phys = 0;
-    size_t sz = sizeof(phys);
-    if (sysctlbyname("hw.physicalcpu", &phys, &sz, nullptr, 0) == 0 && phys > 0) {
-        return static_cast<uint32_t>(phys);
-    }
-#elif defined(__linux__)
-    FILE* f = std::fopen("/proc/cpuinfo", "r");
-    if (f) {
-        char line[256];
-        uint32_t cpu_cores = 0;
-        while (std::fgets(line, sizeof(line), f)) {
-            if (std::strncmp(line, "cpu cores", 9) == 0) {
-                const char* colon = std::strchr(line, ':');
-                if (colon) {
-                    int val = std::atoi(colon + 1);
-                    if (val > 0) {
-                        cpu_cores = static_cast<uint32_t>(val);
-                        break;
-                    }
-                }
-            }
-        }
-        std::fclose(f);
-        if (cpu_cores > 0) return cpu_cores;
-    }
-#endif
-    uint32_t hc = std::thread::hardware_concurrency();
-    if (hc > 1) return hc / 2;
-    return 4;
-}
-
-uint64_t query_system_free_ram() {
-#if defined(_WIN32)
-    MEMORYSTATUSEX status{};
-    status.dwLength = sizeof(status);
-    if (GlobalMemoryStatusEx(&status)) {
-        return static_cast<uint64_t>(status.ullAvailPhys);
-    }
-    return 0;
-#elif defined(__APPLE__)
-    mach_port_t host_port = mach_host_self();
-    vm_size_t page_size = 4096;
-    host_page_size(host_port, &page_size);
-    vm_statistics64_data_t vm_stat{};
-    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-    if (host_statistics64(host_port, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm_stat), &count) == KERN_SUCCESS) {
-        uint64_t free_pages = static_cast<uint64_t>(vm_stat.free_count) + static_cast<uint64_t>(vm_stat.inactive_count);
-        return free_pages * static_cast<uint64_t>(page_size);
-    }
-    return 0;
-#elif defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE)
-    long pages = ::sysconf(_SC_AVPHYS_PAGES);
-    long page_sz = ::sysconf(_SC_PAGESIZE);
-    if (pages > 0 && page_sz > 0) {
-        return static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_sz);
-    }
-    return 0;
-#else
-    return 0;
-#endif
-}
-
-bool get_module_dir_utf8(std::string& out) {
+static bool get_module_dir_utf8(std::string& out) {
 #if defined(_WIN32)
     HMODULE hm = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -175,133 +84,47 @@ bool get_module_dir_utf8(std::string& out) {
     std::string p = info.dli_fname;
     size_t slash = p.find_last_of('/');
     if (slash == std::string::npos) return false;
-    out = (slash == 0) ? "/" : p.substr(0, slash);
+    out = p.substr(0, slash);
     return true;
 #endif
 }
 
- 
-
-
- namespace {
-
-void add_to_dll_path(const std::string& path) {
-#if defined(_WIN32)
-    // 1. Add directory to process PATH environment variable (for cuBLAS/Vulkan delayed DLL loading)
-    char orig_path[32768] = {};
-    DWORD len = GetEnvironmentVariableA("PATH", orig_path, sizeof(orig_path));
-    if (len > 0 && len < sizeof(orig_path)) {
-        std::string new_path = path + ";" + std::string(orig_path);
-        SetEnvironmentVariableA("PATH", new_path.c_str());
-    } else {
-        SetEnvironmentVariableA("PATH", path.c_str());
-    }
-
-    // 2. Add directory to process DLL search path
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-    if (wlen > 0) {
-        std::vector<wchar_t> wbuf(static_cast<size_t>(wlen));
-        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wbuf.data(), wlen);
-        SetDllDirectoryW(wbuf.data());
-    }
-#endif
-
-    ggml_backend_load_all_from_path(path.c_str());
-}
-
- bool ref_llama_backend(std::string& err_out) {
+bool ref_llama_backend() {
     std::lock_guard<std::mutex> lock(g_backend_mutex);
     if (g_backend_ref_count == 0) {
-        const char* single_inst = std::getenv("INFER_SINGLE_INSTANCE");
-        const bool want_lock = (single_inst && std::strcmp(single_inst, "1") == 0);
-
-        if (want_lock) {
 #if defined(_WIN32)
-            SetLastError(0);
-            g_instance_mutex = CreateMutexA(NULL, FALSE, "Local\\InferCoreSingleInstance");
-            DWORD err = GetLastError();
-            if (!g_instance_mutex || err == ERROR_ALREADY_EXISTS || err == ERROR_ACCESS_DENIED) {
-                if (g_instance_mutex) {
-                    CloseHandle(g_instance_mutex);
-                    g_instance_mutex = NULL;
-                }
-                err_out = "Single-instance lock already held or access denied.";
-                return false;
-            }
+        g_instance_mutex = CreateMutexA(NULL, FALSE, "Global\\InferCoreSingleInstance");
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            if (g_instance_mutex) { CloseHandle(g_instance_mutex); g_instance_mutex = NULL; }
+            return false;
+        }
 #else
-            std::string lock_path;
-            const char* xdg_dir = std::getenv("XDG_RUNTIME_DIR");
-            if (xdg_dir && *xdg_dir) {
-                lock_path = std::string(xdg_dir) + "/infer_core_single_instance.lock";
-            } else {
-                lock_path = "/tmp/infer_core_single_instance_" +
-                            std::to_string(static_cast<unsigned long>(::getuid())) + ".lock";
-            }
-            g_instance_fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
-            if (g_instance_fd < 0) {
-                err_out = "Failed to open single-instance lock file: " + lock_path;
-                return false;
-            }
-            struct flock fl{};
-            fl.l_type   = F_WRLCK;
-            fl.l_whence = SEEK_SET;
-            if (::fcntl(g_instance_fd, F_SETLK, &fl) < 0) {
-                ::close(g_instance_fd);
-                g_instance_fd = -1;
-                err_out = "Single-instance file lock already held: " + lock_path;
-                return false;
-            }
+        g_instance_fd = ::open("/tmp/infer_core_single_instance.lock", O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (g_instance_fd < 0) return false;
+        struct flock fl{};
+        fl.l_type = F_WRLCK;
+        fl.l_whence = SEEK_SET;
+        if (::fcntl(g_instance_fd, F_SETLK, &fl) < 0) {
+            ::close(g_instance_fd);
+            g_instance_fd = -1;
+            return false;
+        }
 #endif
-        }
-
-        if (const char* e = std::getenv("INFER_N_THREADS")) {
-            int v = std::atoi(e);
-            g_cached_env_threads = (v > 0) ? std::min(v, 256) : 0;
-        } else {
-            g_cached_env_threads = 0;
-        }
-        g_cached_phys_cores = detect_physical_cores();
-
         std::string dir;
         if (!get_module_dir_utf8(dir)) {
 #if defined(_WIN32)
-            if (g_instance_mutex) {
-                CloseHandle(g_instance_mutex);
-                g_instance_mutex = NULL;
-            }
+            if (g_instance_mutex) { CloseHandle(g_instance_mutex); g_instance_mutex = NULL; }
 #else
-            if (g_instance_fd >= 0) {
-                ::close(g_instance_fd);
-                g_instance_fd = -1;
-            }
+            if (g_instance_fd >= 0) { ::close(g_instance_fd); g_instance_fd = -1; }
 #endif
-            err_out = "Failed to resolve module directory for backend initialization.";
             return false;
         }
-
-        // 1. Scan root executable directory
-        add_to_dll_path(dir);
-
-        // 2. Scan subdirectories (cuda/, vulkan/)
-        static const char* const subdirs[] = {
-            "/cuda",
-            "/vulkan"
-        };
-
-        for (const char* sub : subdirs) {
-            std::string subpath = dir + sub;
-            add_to_dll_path(subpath);
-        }
-
+        ggml_backend_load_all_from_path(dir.c_str());
         llama_backend_init();
     }
     g_backend_ref_count++;
     return true;
 }
-
-} // anonymous namespace
-
-
 
 void unref_llama_backend() {
     std::lock_guard<std::mutex> lock(g_backend_mutex);
@@ -309,19 +132,15 @@ void unref_llama_backend() {
     if (g_backend_ref_count <= 0) {
         llama_backend_free();
 #if defined(_WIN32)
-        if (g_instance_mutex) {
-            CloseHandle(g_instance_mutex);
-            g_instance_mutex = NULL;
-        }
+        if (g_instance_mutex) { CloseHandle(g_instance_mutex); g_instance_mutex = NULL; }
 #else
-        if (g_instance_fd >= 0) {
-            ::close(g_instance_fd);
-            g_instance_fd = -1;
-        }
+        if (g_instance_fd >= 0) { ::close(g_instance_fd); g_instance_fd = -1; }
 #endif
         g_backend_ref_count = 0;
     }
 }
+
+
 
 infer_log_level map_log_level(enum ggml_log_level level) {
     switch (level) {
@@ -351,9 +170,9 @@ void internal_ggml_log(enum ggml_log_level level, const char* text, void* user_d
     }
 }
 
-std::atomic<uint32_t> g_tmp_counter{0};
+static std::atomic<uint32_t> g_tmp_counter{0};
 
-std::string make_tmp_path(const char* dst) {
+static std::string make_tmp_path(const char* dst) {
 #if defined(_WIN32)
     unsigned long pid = GetCurrentProcessId();
 #else
@@ -368,8 +187,8 @@ FILE* open_file_utf8(const char* path, const char* mode) {
     int wpath_len = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
     int wmode_len = MultiByteToWideChar(CP_UTF8, 0, mode, -1, nullptr, 0);
     if (wpath_len > 0 && wmode_len > 0) {
-        std::vector<wchar_t> wpath(static_cast<size_t>(wpath_len));
-        std::vector<wchar_t> wmode(static_cast<size_t>(wmode_len));
+        std::vector<wchar_t> wpath(wpath_len);
+        std::vector<wchar_t> wmode(wmode_len);
         MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath.data(), wpath_len);
         MultiByteToWideChar(CP_UTF8, 0, mode, -1, wmode.data(), wmode_len);
         return _wfopen(wpath.data(), wmode.data());
@@ -384,7 +203,7 @@ bool remove_file_utf8(const char* path) {
 #if defined(_WIN32)
     int wpath_len = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
     if (wpath_len > 0) {
-        std::vector<wchar_t> wpath(static_cast<size_t>(wpath_len));
+        std::vector<wchar_t> wpath(wpath_len);
         MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath.data(), wpath_len);
         return _wremove(wpath.data()) == 0;
     }
@@ -404,7 +223,7 @@ struct TmpGuard {
     }
 };
 
-FILE* open_tmp_exclusive(const std::string& path) {
+static FILE* open_tmp_exclusive(const std::string& path) {
 #if defined(_WIN32)
     int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
     if (wlen <= 0) return nullptr;
@@ -412,18 +231,15 @@ FILE* open_tmp_exclusive(const std::string& path) {
     MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, w.data(), wlen);
     return _wfopen(w.data(), L"wbx");
 #else
-    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
     if (fd < 0) return nullptr;
     FILE* f = ::fdopen(fd, "wb");
-    if (!f) {
-        ::close(fd);
-        ::unlink(path.c_str());
-    }
+    if (!f) { ::close(fd); ::unlink(path.c_str()); }
     return f;
 #endif
 }
 
-bool sync_file(FILE* f) {
+static bool sync_file(FILE* f) {
     if (std::fflush(f) != 0) return false;
 #if defined(_WIN32)
     return _commit(_fileno(f)) == 0;
@@ -436,11 +252,11 @@ bool sync_file(FILE* f) {
 #endif
 }
 
-void sync_parent_dir(const char* filepath) {
+static void sync_parent_dir(const char* filepath) {
 #if !defined(_WIN32)
     std::string path(filepath);
     size_t slash = path.find_last_of('/');
-    std::string dir = (slash == std::string::npos) ? "." : (slash == 0 ? "/" : path.substr(0, slash));
+    std::string dir = (slash != std::string::npos) ? path.substr(0, slash) : ".";
     int fd = ::open(dir.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd >= 0) {
         ::fsync(fd);
@@ -467,55 +283,15 @@ bool file_size_64(FILE* f, uint64_t& out) {
 #endif
 }
 
-struct Crc32Tables {
-    uint32_t tab[8][256]{};
-    constexpr Crc32Tables() {
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t c = i;
-            for (int j = 0; j < 8; ++j) {
-                c = (c >> 1) ^ (0xEDB88320u & (~(c & 1u) + 1u));
-            }
-            tab[0][i] = c;
-        }
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t c = tab[0][i];
-            for (int k = 1; k < 8; ++k) {
-                c = tab[0][c & 0xFFu] ^ (c >> 8);
-                tab[k][i] = c;
-            }
+static uint32_t compute_crc32(const uint8_t* data, size_t len) {
+    if (!data || len == 0) return 0;
+    uint32_t crc = 0xFFFFFFFF;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; ++j) {
+            crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
         }
     }
-};
-
-constexpr Crc32Tables g_crc32_tables{};
-
-uint32_t update_crc32(uint32_t crc_in, const void* buf, size_t len) {
-    if (!buf || len == 0) return crc_in;
-    const auto* data = static_cast<const uint8_t*>(buf);
-    uint32_t crc = ~crc_in;
-
-    while (len >= 8) {
-        uint32_t b0 = data[0] ^ (crc & 0xFFu);
-        uint32_t b1 = data[1] ^ ((crc >> 8) & 0xFFu);
-        uint32_t b2 = data[2] ^ ((crc >> 16) & 0xFFu);
-        uint32_t b3 = data[3] ^ ((crc >> 24) & 0xFFu);
-        crc = g_crc32_tables.tab[7][b0] ^
-              g_crc32_tables.tab[6][b1] ^
-              g_crc32_tables.tab[5][b2] ^
-              g_crc32_tables.tab[4][b3] ^
-              g_crc32_tables.tab[3][data[4]] ^
-              g_crc32_tables.tab[2][data[5]] ^
-              g_crc32_tables.tab[1][data[6]] ^
-              g_crc32_tables.tab[0][data[7]];
-        data += 8;
-        len -= 8;
-    }
-
-    while (len > 0) {
-        crc = g_crc32_tables.tab[0][(crc ^ *data++) & 0xFFu] ^ (crc >> 8);
-        --len;
-    }
-
     return ~crc;
 }
 
@@ -548,50 +324,7 @@ bool want_bos(const struct llama_vocab* v, const char* text) {
     return !(bos && std::strncmp(text, bos, std::strlen(bos)) == 0);
 }
 
-bool tokenize_checked(
-    const struct llama_vocab* vocab,
-    const char* text,
-    size_t text_len,
-    bool add_special,
-    bool parse_special,
-    std::vector<llama_token>* out_tokens,
-    int32_t* out_count = nullptr
-) {
-    if (!vocab || !text || text_len > static_cast<size_t>(INT32_MAX)) {
-        return false;
-    }
-    const int32_t len_i32 = static_cast<int32_t>(text_len);
-    const int32_t n = llama_tokenize(vocab, text, len_i32, nullptr, 0, add_special, parse_special);
-    if (n == INT32_MIN) {
-        return false;
-    }
-    int32_t needed = (n < 0) ? -n : n;
-    if (needed <= 0) {
-        if (out_count) *out_count = 0;
-        if (out_tokens) out_tokens->clear();
-        return (text_len == 0);
-    }
-    if (!out_tokens) {
-        if (out_count) *out_count = needed;
-        return true;
-    }
-    out_tokens->resize(static_cast<size_t>(needed));
-    int32_t actual = llama_tokenize(
-        vocab, text, len_i32, out_tokens->data(), static_cast<int32_t>(out_tokens->size()), add_special, parse_special);
-    if (actual < 0) {
-        if (actual == INT32_MIN) return false;
-        needed = -actual;
-        out_tokens->resize(static_cast<size_t>(needed));
-        actual = llama_tokenize(
-            vocab, text, len_i32, out_tokens->data(), static_cast<int32_t>(out_tokens->size()), add_special, parse_special);
-        if (actual < 0) return false;
-    }
-    out_tokens->resize(static_cast<size_t>(actual));
-    if (out_count) *out_count = actual;
-    return true;
-}
-
-bool is_plain_html_tag(const char* t, size_t len) {
+static bool is_plain_html_tag(const char* t, size_t len) {
     static const char* const tags[] = {
         "a","b","i","u","p","br","hr","em","li","ol","ul","tr","td","th","sub","sup",
         "h1","h2","h3","h4","h5","h6","div","img","pre","span","code","table","thead",
@@ -599,17 +332,14 @@ bool is_plain_html_tag(const char* t, size_t len) {
     };
     const char* name = t + 1;
     size_t n = len - 2;
-    if (n > 0 && name[0] == '/') {
-        ++name;
-        --n;
-    }
+    if (n > 0 && name[0] == '/') { ++name; --n; }
     for (const char* tag : tags) {
         if (n == std::strlen(tag) && std::memcmp(name, tag, n) == 0) return true;
     }
     return false;
 }
 
-std::vector<std::string> collect_special_texts(const struct llama_vocab* v) {
+static std::vector<std::string> collect_special_texts(const struct llama_vocab* v) {
     std::vector<std::string> out;
     if (!v) return out;
     const int32_t n = llama_vocab_n_tokens(v);
@@ -635,7 +365,7 @@ std::vector<std::string> collect_special_texts(const struct llama_vocab* v) {
 }
 
 struct SpecialTokenLookup {
-    std::unordered_set<std::string> set;
+    std::unordered_set<std::string_view> set;
     size_t min_len = SIZE_MAX;
     size_t max_len = 0;
 
@@ -649,15 +379,9 @@ struct SpecialTokenLookup {
             if (sp.size() > max_len) max_len = sp.size();
         }
     }
-
-    void clear() {
-        set.clear();
-        min_len = SIZE_MAX;
-        max_len = 0;
-    }
 };
 
-std::string neutralize_special_fast(const char* in, const SpecialTokenLookup& lookup) {
+static std::string neutralize_special_fast(const char* in, const SpecialTokenLookup& lookup) {
     if (!in || !*in) return "";
     if (lookup.set.empty()) return std::string(in);
 
@@ -666,18 +390,16 @@ std::string neutralize_special_fast(const char* in, const SpecialTokenLookup& lo
     std::string out;
     out.reserve(s.size());
 
-    std::string probe;
     for (size_t i = 0; i < s.size(); ++i) {
         const char c = s[i];
         bool hit = false;
         if (c == '<' || c == '[') {
             const size_t rem = s.size() - i;
             const size_t max_check = std::min(rem, lookup.max_len);
-            const char expected_close = (c == '<') ? '>' : ']';
             for (size_t len = lookup.min_len; len <= max_check; ++len) {
+                char expected_close = (c == '<') ? '>' : ']';
                 if (s[i + len - 1] == expected_close) {
-                    probe.assign(s.data() + i, len);
-                    if (lookup.set.count(probe) > 0) {
+                    if (lookup.set.count(s.substr(i, len)) > 0) {
                         hit = true;
                         break;
                     }
@@ -690,91 +412,55 @@ std::string neutralize_special_fast(const char* in, const SpecialTokenLookup& lo
     return out;
 }
 
-bool is_valid_role(const char* r) {
+static bool is_valid_role(const char* r) {
     if (!r) return false;
     static const char* const ok[] = {"system", "user", "assistant", "tool", "developer"};
-    for (const char* o : ok) {
-        if (std::strcmp(r, o) == 0) return true;
-    }
+    for (const char* o : ok) if (std::strcmp(r, o) == 0) return true;
     return false;
 }
 
-uint64_t compute_model_fingerprint(struct llama_model* model) {
+static uint64_t compute_model_fingerprint(struct llama_model* model) {
     if (!model) return 0;
     uint64_t h = 14695981039346656037ULL;
-    auto add_bytes = [&h](const void* data, size_t len) {
-        const auto* p = static_cast<const uint8_t*>(data);
-        for (size_t i = 0; i < len; ++i) {
-            h ^= p[i];
+    auto add_u64 = [&h](uint64_t val) {
+        for (int i = 0; i < 8; ++i) {
+            h ^= (val & 0xFF);
             h *= 1099511628211ULL;
+            val >>= 8;
         }
     };
-    auto add_u64 = [&add_bytes](uint64_t val) {
-        add_bytes(&val, sizeof(val));
-    };
-    auto add_cstr = [&add_bytes](const char* s) {
-        if (s) add_bytes(s, std::strlen(s) + 1);
-    };
-
     add_u64(static_cast<uint64_t>(llama_model_n_ctx_train(model)));
     add_u64(static_cast<uint64_t>(llama_model_n_embd(model)));
     add_u64(static_cast<uint64_t>(llama_model_n_layer(model)));
     add_u64(static_cast<uint64_t>(llama_model_n_head(model)));
-    add_u64(static_cast<uint64_t>(llama_model_n_head_kv(model)));
     add_u64(static_cast<uint64_t>(llama_model_size(model)));
     add_u64(static_cast<uint64_t>(llama_model_n_params(model)));
 
     const struct llama_vocab* v = llama_model_get_vocab(model);
-    const int32_t n_vocab = v ? llama_vocab_n_tokens(v) : 0;
-    add_u64(static_cast<uint64_t>(n_vocab));
+    add_u64(v ? static_cast<uint64_t>(llama_vocab_n_tokens(v)) : 0);
 
     char desc[256] = {};
     llama_model_desc(model, desc, sizeof(desc));
-    add_cstr(desc);
-
-    const char* chat_tmpl = llama_model_chat_template(model, nullptr);
-    add_cstr(chat_tmpl ? chat_tmpl : "");
-
-    const int32_t meta_count = llama_model_meta_count(model);
-    add_u64(static_cast<uint64_t>(meta_count));
-    char key_buf[256];
-    char val_buf[512];
-    for (int32_t i = 0; i < meta_count; ++i) {
-        if (llama_model_meta_key_by_index(model, i, key_buf, sizeof(key_buf)) >= 0) {
-            add_cstr(key_buf);
-        }
-        if (llama_model_meta_val_str_by_index(model, i, val_buf, sizeof(val_buf)) >= 0) {
-            add_cstr(val_buf);
-        }
+    for (const char* p = desc; *p; ++p) {
+        h ^= static_cast<uint8_t>(*p);
+        h *= 1099511628211ULL;
     }
-
-    if (v && n_vocab > 0) {
-        const int32_t step = std::max<int32_t>(1, n_vocab / 64);
-        for (int32_t tok = 0; tok < n_vocab; tok += step) {
-            const char* t = llama_vocab_get_text(v, tok);
-            if (t) add_cstr(t);
-        }
-    }
-
     return h;
 }
 
-bool v1_stream_adapter(const char* piece, size_t len, void* udata);
-
-struct V1StreamThunk {
-    infer_stream_cb cb = nullptr;
-    void* user_data    = nullptr;
-};
-
-bool v1_stream_adapter(const char* piece, size_t len, void* udata) {
-    (void)len;
-    auto* thunk = static_cast<V1StreamThunk*>(udata);
-    return thunk && thunk->cb ? thunk->cb(piece, thunk->user_data) : false;
+static bool safe_kv_seq_rm(struct llama_context* lctx, int seq_id, int p0, int p1) {
+    if (!lctx) return false;
+    bool ok = llama_memory_seq_rm(llama_get_memory(lctx), seq_id, p0, p1);
+    if (!ok && (p0 != 0 || p1 != -1)) {
+        llama_memory_clear(llama_get_memory(lctx), false);
+        return false;
+    }
+    return ok;
 }
 
 class StreamOutputBuffer {
 public:
-    StreamOutputBuffer(infer_stream_cb_v2 cb, void* udata, const std::vector<std::string>& stops)
+    StreamOutputBuffer(infer_stream_cb cb, void* udata, const std::vector<std::string>& stops)
         : callback_(cb), user_data_(udata), stop_words_(stops) {
         for (const auto& w : stop_words_) {
             if (w.size() > max_stop_len_) {
@@ -805,8 +491,7 @@ public:
                 std::string pre = buffer_.substr(0, earliest_pos);
                 size_t valid = find_valid_utf8_end(pre);
                 if (valid > 0 && !user_aborted_) {
-                    pre.resize(valid);
-                    if (!callback_(pre.c_str(), valid, user_data_)) {
+                    if (!callback_(pre.substr(0, valid).c_str(), user_data_)) {
                         user_aborted_ = true;
                     }
                 }
@@ -833,7 +518,7 @@ public:
             std::string to_emit = buffer_.substr(0, flushable);
             buffer_.erase(0, flushable);
             flushed_ += flushable;
-            if (!callback_(to_emit.c_str(), flushable, user_data_)) {
+            if (!callback_(to_emit.c_str(), user_data_)) {
                 user_aborted_ = true;
                 return false;
             }
@@ -863,8 +548,7 @@ public:
                 std::string pre = buffer_.substr(0, earliest_pos);
                 size_t valid = find_valid_utf8_end(pre);
                 if (valid > 0 && !user_aborted_) {
-                    pre.resize(valid);
-                    if (!callback_(pre.c_str(), valid, user_data_)) {
+                    if (!callback_(pre.substr(0, valid).c_str(), user_data_)) {
                         user_aborted_ = true;
                     }
                 }
@@ -876,8 +560,7 @@ public:
         if (!buffer_.empty()) {
             size_t valid = find_valid_utf8_end(buffer_);
             if (valid > 0 && !user_aborted_) {
-                std::string emit = buffer_.substr(0, valid);
-                if (!callback_(emit.c_str(), valid, user_data_)) {
+                if (!callback_(buffer_.substr(0, valid).c_str(), user_data_)) {
                     user_aborted_ = true;
                 }
             }
@@ -893,7 +576,7 @@ public:
     bool user_aborted() const { return user_aborted_; }
 
 private:
-    infer_stream_cb_v2 callback_;
+    infer_stream_cb callback_;
     void* user_data_;
     const std::vector<std::string>& stop_words_;
     size_t max_stop_len_ = 0;
@@ -915,7 +598,7 @@ struct StateFileHeader {
     uint32_t n_layer;
     uint32_t n_head;
     uint64_t fingerprint;
-    uint32_t payload_crc;   // CRC32 over header (with payload_crc=0) + KV payload + history
+    uint32_t payload_crc;   // CRC32 of binary KV payload
     uint32_t history_bytes; // Byte length of serialized chat history
     uint64_t data_size;
 };
@@ -943,17 +626,17 @@ struct infer_ctx {
 
     infer_sampler_params     sampler_params{};
     std::string              grammar_gbnf;
-    std::string              custom_chat_template;
     std::vector<std::string> stop_words;
+    std::vector<std::string> special_texts;
     SpecialTokenLookup       special_lookup;
     uint32_t                 n_ctx  = 0;
     int                      n_keep = 0;
 
-    std::atomic<int>             n_past{0};
-    std::atomic<bool>            abort_flag{false};
-    std::atomic<bool>            is_generating{false};
-    std::atomic<bool>            last_success{true};
-    std::atomic<std::thread::id> active_gen_thread_id{};
+    std::atomic<int>      n_past{0};
+    std::atomic<bool>     abort_flag{false};
+    std::atomic<bool>     is_generating{false};
+    std::atomic<bool>     last_success{true};
+    std::atomic<uint64_t> gen_counter{0};
 
     std::vector<OwnedMsg>    chat_history;
     std::vector<llama_token> active_kv_tokens;
@@ -980,44 +663,23 @@ struct infer_ctx {
 
 namespace {
 
-void invalidate_kv(infer_ctx* ctx) {
-    if (!ctx) return;
-    if (ctx->lctx) {
-        llama_memory_clear(llama_get_memory(ctx->lctx), false);
-    }
-    ctx->active_kv_tokens.clear();
-    ctx->n_past.store(0, std::memory_order_relaxed);
-    ctx->n_keep = 0;
-}
-
-bool safe_kv_seq_rm(infer_ctx* ctx, int seq_id, int p0, int p1) {
-    if (!ctx || !ctx->lctx) return false;
-    bool ok = llama_memory_seq_rm(llama_get_memory(ctx->lctx), seq_id, p0, p1);
-    if (!ok) {
-        invalidate_kv(ctx);
-        return false;
-    }
-    return true;
-}
-
-void release_gen(infer_ctx* c) {
+static void release_gen(infer_ctx* c) {
     if (!c) return;
     std::lock_guard<std::mutex> lk(c->gen_mutex);
-    c->active_gen_thread_id.store(std::thread::id{}, std::memory_order_release);
     c->is_generating.store(false, std::memory_order_release);
     c->cv_generating.notify_all();
 }
 
 struct GenAcquireGuard {
     infer_ctx* ctx = nullptr;
-    bool acquired  = false;
+    bool acquired = false;
 
     explicit GenAcquireGuard(infer_ctx* c) : ctx(c) {
         if (!ctx) return;
         bool expected = false;
         if (ctx->is_generating.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            ctx->active_gen_thread_id.store(std::this_thread::get_id(), std::memory_order_release);
             acquired = true;
+            ctx->gen_counter.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -1029,111 +691,60 @@ struct GenAcquireGuard {
 };
 
 struct PrefillRollbackGuard {
-    infer_ctx* ctx = nullptr;
+    struct llama_context* lctx = nullptr;
     int start_past = 0;
     bool completed = false;
 
     ~PrefillRollbackGuard() {
-        if (!completed && ctx && ctx->lctx) {
-            if (safe_kv_seq_rm(ctx, 0, start_past, -1)) {
-                if (ctx->active_kv_tokens.size() > static_cast<size_t>(start_past)) {
-                    ctx->active_kv_tokens.resize(static_cast<size_t>(start_past));
-                }
-                ctx->n_past.store(start_past, std::memory_order_relaxed);
-            }
+        if (!completed && lctx) {
+            safe_kv_seq_rm(lctx, 0, start_past, -1);
         }
     }
 };
 
-bool infer_has_real_gpu() {
+static bool infer_has_real_gpu() {
     size_t count = ggml_backend_dev_count();
     for (size_t i = 0; i < count; ++i) {
         auto type = ggml_backend_dev_type(ggml_backend_dev_get(i));
-        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-            return true;
-        }
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) return true;
     }
     return false;
 }
 
-int32_t pick_threads(bool has_gpu, bool batch_phase) {
-    (void)has_gpu;
-    (void)batch_phase;
-    if (g_cached_env_threads > 0) {
-        return g_cached_env_threads;
-    }
-    uint32_t phys = (g_cached_phys_cores > 0) ? g_cached_phys_cores : detect_physical_cores();
-    return static_cast<int32_t>(phys > 0 ? phys : 4);
-}
-
-enum ggml_type map_kv_type(int32_t kv_type) {
-    switch (kv_type) {
-        case INFER_KV_TYPE_F16:     return GGML_TYPE_F16;
-        case INFER_KV_TYPE_BF16:    return GGML_TYPE_BF16;
-        case INFER_KV_TYPE_Q8_0:    return GGML_TYPE_Q8_0;
-        case INFER_KV_TYPE_Q4_0:    return GGML_TYPE_Q4_0;
-        case INFER_KV_TYPE_DEFAULT:
-        default:                    return GGML_TYPE_F16;
-    }
-}
-
-int32_t read_model_meta_i32(struct llama_model* model, const std::string& key, int32_t fallback) {
-    char buf[128] = {};
-    if (llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf)) > 0) {
-        char* endp = nullptr;
-        long v = std::strtol(buf, &endp, 10);
-        if (endp != buf && v > 0 && v <= INT32_MAX) {
-            return static_cast<int32_t>(v);
-        }
-    }
-    return fallback;
-}
-
- 
-
-
-// ============================================================================
-// Replace calculate_safe_n_ctx in infer_core.cpp (inside anonymous namespace)
-// ============================================================================
-uint32_t calculate_safe_n_ctx(
-    struct llama_model* model,
-    uint32_t requested_ctx,
-    int32_t n_gpu_layers,
-    enum ggml_type type_k,
-    enum ggml_type type_v
-) {
-    uint32_t max_train = static_cast<uint32_t>(llama_model_n_ctx_train(model));
-
-    uint64_t total_vram = 0;
-    uint64_t free_vram  = 0;
+static ggml_backend_dev_t infer_get_optimal_device() {
     size_t dev_count = ggml_backend_dev_count();
+    ggml_backend_dev_t fallback_dev = nullptr;
+    ggml_backend_dev_t igpu_dev     = nullptr;
+
     for (size_t i = 0; i < dev_count; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        auto dtype = ggml_backend_dev_type(dev);
-        if (dtype == GGML_BACKEND_DEVICE_TYPE_GPU || dtype == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-            size_t dev_free = 0, dev_total = 0;
-            ggml_backend_dev_memory(dev, &dev_free, &dev_total);
-            total_vram += static_cast<uint64_t>(dev_total);
-            free_vram  += static_cast<uint64_t>(dev_free);
+        enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            return dev;
+        }
+        if (type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            igpu_dev = dev;
         }
     }
+    return igpu_dev ? igpu_dev : fallback_dev;
+}
 
-    uint64_t free_sys_ram = query_system_free_ram();
-
-    // Auto-select target context from GPU VRAM + System RAM
-    uint32_t auto_tier_ctx = DEFAULT_FALLBACK_CTX; // 4096 default (6 GB GPU)
-    if (total_vram == 0) {
-        // CPU-only mode: scale with System RAM (8192 if >= 16 GB free RAM, else 4096)
-        auto_tier_ctx = (free_sys_ram >= (12000ULL * 1024ULL * 1024ULL)) ? 8192 : 4096;
-    } else if (total_vram <= (4600ULL * 1024ULL * 1024ULL)) {
-        auto_tier_ctx = 2048;  // <= 4 GB GPU
-    } else if (total_vram >= (14000ULL * 1024ULL * 1024ULL)) {
-        auto_tier_ctx = 16384; // >= 16 GB GPU
-    } else if (total_vram >= (7500ULL * 1024ULL * 1024ULL)) {
-        auto_tier_ctx = 8192;  // 8 GB - 12 GB GPU
+static int32_t pick_threads(bool has_gpu, bool batch_phase) {
+    if (const char* e = std::getenv("INFER_N_THREADS")) {
+        int v = std::atoi(e);
+        if (v > 0) return std::min(v, 256);
     }
+    uint32_t hc = std::thread::hardware_concurrency();
+    if (hc == 0) hc = 4;
+    if (has_gpu) {
+        return static_cast<int32_t>(batch_phase ? std::min<uint32_t>(hc, 8) : std::min<uint32_t>(std::max<uint32_t>(1, hc / 2), 4));
+    }
+    return static_cast<int32_t>(hc);
+}
 
-    uint32_t target_ctx = (requested_ctx > 0) ? requested_ctx : auto_tier_ctx;
+static uint32_t calculate_safe_n_ctx(struct llama_model* model, uint32_t requested_ctx) {
+    uint32_t max_train = static_cast<uint32_t>(llama_model_n_ctx_train(model));
+    uint32_t target_ctx = (requested_ctx > 0) ? requested_ctx : DEFAULT_FALLBACK_CTX;
     if (max_train > 0) {
         target_ctx = std::min<uint32_t>(target_ctx, max_train);
     }
@@ -1147,126 +758,41 @@ uint32_t calculate_safe_n_ctx(
         return target_ctx;
     }
 
-    int32_t default_head_dim = n_embd / n_head;
-    int32_t head_dim_k = default_head_dim;
-    int32_t head_dim_v = default_head_dim;
+    int32_t head_dim_k = n_embd / n_head;
+    int32_t head_dim_v = head_dim_k;
 
-    char arch_buf[64] = {};
-    if (llama_model_meta_val_str(model, "general.architecture", arch_buf, sizeof(arch_buf)) > 0) {
-        std::string arch(arch_buf);
-        head_dim_k = read_model_meta_i32(model, arch + ".attention.key_length", default_head_dim);
-        head_dim_v = read_model_meta_i32(model, arch + ".attention.value_length", head_dim_k);
+    constexpr size_t bytes_per_element = 2; // GGML_TYPE_F16
+    size_t bytes_per_token = static_cast<size_t>(n_layer) * n_head_kv * (head_dim_k + head_dim_v) * bytes_per_element;
+
+    ggml_backend_dev_t dev = infer_get_optimal_device();
+    size_t free_vram = 0, total_vram = 0;
+
+    if (dev) {
+        ggml_backend_dev_memory(dev, &free_vram, &total_vram);
     }
 
-    const size_t blck_k = std::max<size_t>(1, ggml_blck_size(type_k));
-    const size_t blck_v = std::max<size_t>(1, ggml_blck_size(type_v));
-    const size_t row_bytes_k = (static_cast<size_t>(n_head_kv) * static_cast<size_t>(head_dim_k) * ggml_type_size(type_k)) / blck_k;
-    const size_t row_bytes_v = (static_cast<size_t>(n_head_kv) * static_cast<size_t>(head_dim_v) * ggml_type_size(type_v)) / blck_v;
-    const size_t bytes_per_token = static_cast<size_t>(n_layer) * (row_bytes_k + row_bytes_v);
-
-    if (bytes_per_token == 0) {
+    if (free_vram == 0 || bytes_per_token == 0) {
         return target_ctx;
     }
 
-    // In Hybrid GPU+RAM mode (when n_gpu_layers < n_layer), KV layers on CPU use System RAM!
-    uint64_t usable_pool = (n_gpu_layers != 0) ? free_vram : free_sys_ram;
-    if (n_gpu_layers > 0 && n_gpu_layers < n_layer && free_sys_ram > usable_pool) {
-        // Hybrid offload: KV cache is split between VRAM and System RAM
-        usable_pool += (free_sys_ram / 4);
-    }
-    if (usable_pool == 0) {
-        usable_pool = free_sys_ram;
-    }
-    if (usable_pool == 0) {
-        return target_ctx;
+    // FIX 11: keep a real reserve for compute buffers, the renderer and other apps.
+    // Also pad bytes_per_token 1.5x: n_embd/n_head under-estimates head_dim on some models (e.g. Qwen3-4B).
+    bytes_per_token = bytes_per_token * 3 / 2;
+    const size_t headroom = std::max<size_t>(1024ULL * 1024ULL * 1024ULL, total_vram / 7);
+    if (free_vram <= headroom) {
+        return std::min<uint32_t>(target_ctx, 512);
     }
 
-    constexpr uint64_t headroom = 384ULL * 1024ULL * 1024ULL;
-    if (usable_pool <= headroom) {
-        return std::min<uint32_t>(target_ctx, 2048);
-    }
+    size_t available_vram = free_vram - headroom;
+    uint32_t safe_tokens = static_cast<uint32_t>(available_vram / bytes_per_token);
 
-    uint64_t available_mem = usable_pool - headroom;
-    uint64_t max_tokens_64 = available_mem / static_cast<uint64_t>(bytes_per_token);
-    uint32_t safe_tokens = (max_tokens_64 > UINT32_MAX) ? UINT32_MAX : static_cast<uint32_t>(max_tokens_64);
-
-    uint32_t floor_ctx = std::min<uint32_t>(target_ctx, 2048);
+    uint32_t floor_ctx = std::min<uint32_t>(target_ctx, 512);
     return std::max<uint32_t>(floor_ctx, std::min<uint32_t>(target_ctx, safe_tokens));
 }
 
-
-
-template <typename T, typename = void>
-struct has_flash_attn_bool : std::false_type {};
-
-template <typename T>
-struct has_flash_attn_bool<T, std::void_t<decltype(std::declval<T&>().flash_attn = true)>> : std::true_type {};
-
-template <typename T, typename = void>
-struct has_flash_attn_type : std::false_type {};
-
-template <typename T>
-struct has_flash_attn_type<T, std::void_t<decltype(std::declval<T&>().flash_attn_type)>> : std::true_type {};
-
-template <typename CtxParams = struct llama_context_params>
-void apply_flash_attn_param(CtxParams& ctx_params, bool enable) {
-    if constexpr (has_flash_attn_bool<CtxParams>::value) {
-        ctx_params.flash_attn = enable;
-    } else if constexpr (has_flash_attn_type<CtxParams>::value) {
-        using FaEnum = decltype(ctx_params.flash_attn_type);
-        ctx_params.flash_attn_type = static_cast<FaEnum>(enable ? 1 : 0);
-    } else {
-        (void)ctx_params;
-        (void)enable;
-    }
-}
-
-template <typename T, typename = void>
-struct has_model_use_mmap : std::false_type {};
-
-template <typename T>
-struct has_model_use_mmap<T, std::void_t<decltype(std::declval<T&>().use_mmap = true)>> : std::true_type {};
-
-template <typename T, typename = void>
-struct has_model_use_mlock : std::false_type {};
-
-template <typename T>
-struct has_model_use_mlock<T, std::void_t<decltype(std::declval<T&>().use_mlock = true)>> : std::true_type {};
-
-template <typename T, typename = void>
-struct has_model_load_mode : std::false_type {};
-
-template <typename T>
-struct has_model_load_mode<T, std::void_t<decltype(std::declval<T&>().load_mode)>> : std::true_type {};
-
-template <typename ModelParams = struct llama_model_params>
-void apply_model_load_params(ModelParams& llama_mparams, bool use_mmap, bool use_mlock) {
-    if constexpr (has_model_use_mmap<ModelParams>::value) {
-        llama_mparams.use_mmap = use_mmap;
-    }
-    if constexpr (has_model_use_mlock<ModelParams>::value) {
-        llama_mparams.use_mlock = use_mlock;
-    }
-    if constexpr (has_model_load_mode<ModelParams>::value) {
-        using ModeEnum = decltype(llama_mparams.load_mode);
-        if (use_mmap && use_mlock) {
-            llama_mparams.load_mode = static_cast<ModeEnum>(3); // LLAMA_LOAD_MODE_MMAP_MLOCK
-        } else if (use_mlock) {
-            llama_mparams.load_mode = static_cast<ModeEnum>(2); // LLAMA_LOAD_MODE_MLOCK
-        } else if (use_mmap) {
-            llama_mparams.load_mode = static_cast<ModeEnum>(1); // LLAMA_LOAD_MODE_MMAP
-        } else {
-            llama_mparams.load_mode = static_cast<ModeEnum>(0); // LLAMA_LOAD_MODE_NONE
-        }
-    }
-}
-
-using UniqueSampler = std::unique_ptr<struct llama_sampler, decltype(&llama_sampler_free)>;
-
-UniqueSampler create_sampler(
+static struct llama_sampler* create_sampler(
     const infer_sampler_params& params_in,
     struct llama_model* model,
-    uint32_t n_ctx,
     const std::string& grammar_gbnf,
     std::string& err_out,
     struct llama_sampler** penalty_smpl_out = nullptr
@@ -1274,43 +800,38 @@ UniqueSampler create_sampler(
     if (penalty_smpl_out) *penalty_smpl_out = nullptr;
 
     infer_sampler_params params = params_in;
-    if (std::isnan(params.temperature) || std::isinf(params.temperature)) {
+    if (std::isnan(params.temperature) || std::isinf(params.temperature) || params.temperature < 0.0f) {
         err_out = "Invalid temperature parameter.";
-        return UniqueSampler(nullptr, &llama_sampler_free);
-    }
-    if (params.temperature < 0.0f) {
-        params.temperature = 0.0f;
+        return nullptr;
     }
     if (std::isnan(params.top_p) || std::isinf(params.top_p) || params.top_p < 0.0f || params.top_p > 1.0f) {
         err_out = "Invalid top_p parameter.";
-        return UniqueSampler(nullptr, &llama_sampler_free);
+        return nullptr;
     }
     if (std::isnan(params.min_p) || std::isinf(params.min_p) || params.min_p < 0.0f || params.min_p > 1.0f) {
         err_out = "Invalid min_p parameter.";
-        return UniqueSampler(nullptr, &llama_sampler_free);
+        return nullptr;
     }
     if (std::isnan(params.repeat_penalty) || std::isinf(params.repeat_penalty) || params.repeat_penalty < 0.0f) {
         err_out = "Invalid repeat_penalty parameter.";
-        return UniqueSampler(nullptr, &llama_sampler_free);
+        return nullptr;
     }
 
     struct llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
-    UniqueSampler chain(llama_sampler_chain_init(sparams), &llama_sampler_free);
+    struct llama_sampler* chain = llama_sampler_chain_init(sparams);
     if (!chain) {
         err_out = "Failed to allocate sampler chain.";
-        return UniqueSampler(nullptr, &llama_sampler_free);
+        return nullptr;
     }
 
     const struct llama_vocab* vocab = model ? llama_model_get_vocab(model) : nullptr;
 
     if (params.repeat_penalty > 0.0f && params.repeat_penalty != 1.0f && vocab) {
-        const int32_t max_window = (n_ctx > 0) ? static_cast<int32_t>(std::min<uint32_t>(n_ctx, 65536u)) : 4096;
-        int32_t last_n = (params.repeat_last_n <= 0) ? 64 : params.repeat_last_n;
-        last_n = std::min(last_n, max_window);
+        int32_t last_n = (params.repeat_last_n > 0) ? params.repeat_last_n : 64;
         int32_t n_vocab = llama_vocab_n_tokens(vocab);
         struct llama_sampler* psmpl = llama_sampler_init_penalties(n_vocab, last_n, params.repeat_penalty, 0.0f, 0.0f);
         if (psmpl) {
-            llama_sampler_chain_add(chain.get(), psmpl);
+            llama_sampler_chain_add(chain, psmpl);
             if (penalty_smpl_out) *penalty_smpl_out = psmpl;
         }
     }
@@ -1318,113 +839,42 @@ UniqueSampler create_sampler(
     if (!grammar_gbnf.empty() && vocab) {
         struct llama_sampler* gsampler = llama_sampler_init_grammar(vocab, grammar_gbnf.c_str(), "root");
         if (gsampler) {
-            llama_sampler_chain_add(chain.get(), gsampler);
+            llama_sampler_chain_add(chain, gsampler);
         } else {
             err_out = "Failed to parse grammar rules.";
-            if (penalty_smpl_out) *penalty_smpl_out = nullptr;
-            return UniqueSampler(nullptr, &llama_sampler_free);
+            llama_sampler_free(chain);
+            return nullptr;
         }
     }
 
     if (params.top_k > 0) {
-        llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(params.top_k));
+        llama_sampler_chain_add(chain, llama_sampler_init_top_k(params.top_k));
     }
     if (params.top_p > 0.0f && params.top_p < 1.0f) {
-        llama_sampler_chain_add(chain.get(), llama_sampler_init_top_p(params.top_p, 1));
+        llama_sampler_chain_add(chain, llama_sampler_init_top_p(params.top_p, 1));
     }
     if (params.min_p > 0.0f && params.min_p < 1.0f) {
-        llama_sampler_chain_add(chain.get(), llama_sampler_init_min_p(params.min_p, 1));
+        llama_sampler_chain_add(chain, llama_sampler_init_min_p(params.min_p, 1));
     }
 
     if (params.temperature > 0.0f) {
-        llama_sampler_chain_add(chain.get(), llama_sampler_init_temp(params.temperature));
-        llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(params.seed ? params.seed : LLAMA_DEFAULT_SEED));
+        llama_sampler_chain_add(chain, llama_sampler_init_temp(params.temperature));
+        llama_sampler_chain_add(chain, llama_sampler_init_dist(params.seed ? params.seed : LLAMA_DEFAULT_SEED));
     } else {
-        llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());
+        llama_sampler_chain_add(chain, llama_sampler_init_greedy());
     }
 
     return chain;
 }
 
-bool render_chat_template_with_fallback(
-    infer_ctx* ctx,
-    const std::vector<struct llama_chat_message>& llama_msgs,
-    std::string& out_rendered
-) {
-    const char* model_tmpl = llama_model_chat_template(ctx->model, nullptr);
-    const char* active_tmpl = !ctx->custom_chat_template.empty()
-                                  ? ctx->custom_chat_template.c_str()
-                                  : model_tmpl;
+} // anonymous namespace
 
-    auto try_apply = [&](const char* tmpl) -> bool {
-        if (!tmpl || !*tmpl) return false;
-        int alloc_size = llama_chat_apply_template(tmpl, llama_msgs.data(), llama_msgs.size(), true, nullptr, 0);
-        if (alloc_size <= 0) return false;
-        std::vector<char> buf(static_cast<size_t>(alloc_size) + 1, '\0');
-        int written = llama_chat_apply_template(tmpl, llama_msgs.data(), llama_msgs.size(), true, buf.data(), static_cast<int32_t>(buf.size()));
-        if (written < 0) return false;
-        out_rendered.assign(buf.data(), static_cast<size_t>(written));
-        return true;
-    };
-
-    if (try_apply(active_tmpl)) {
-        return true;
-    }
-
-    if (try_apply("chatml")) {
-        return true;
-    }
-
-    std::string tmpl_name = active_tmpl ? active_tmpl : "<none>";
-    if (tmpl_name.size() > 64) {
-        tmpl_name = tmpl_name.substr(0, 64) + "...";
-    }
-    ctx->set_error("Chat template formatting failed for template: '" + tmpl_name + "'");
-    return false;
-}
-
-bool validate_chat_messages(infer_ctx* ctx, const infer_chat_msg* msgs, size_t num_msgs) {
-    for (size_t i = 0; i < num_msgs; ++i) {
-        if (!msgs[i].role || !msgs[i].content) {
-            ctx->set_error("Message role or content cannot be null.");
-            return false;
-        }
-        if (!is_valid_role(msgs[i].role)) {
-            ctx->set_error("Invalid message role (allowed: system, user, assistant, tool, developer).");
-            return false;
-        }
-    }
-    return true;
-}
-
-void free_model_resources_locked(infer_ctx* ctx) {
-    if (ctx->sampler) {
-        llama_sampler_free(ctx->sampler);
-        ctx->sampler      = nullptr;
-        ctx->penalty_smpl = nullptr;
-    }
-    if (ctx->lctx) {
-        llama_free(ctx->lctx);
-        ctx->lctx = nullptr;
-    }
-    if (ctx->model) {
-        llama_model_free(ctx->model);
-        ctx->model = nullptr;
-    }
-    ctx->special_lookup.clear();
-    ctx->n_ctx  = 0;
-    ctx->n_keep = 0;
-    ctx->n_past.store(0, std::memory_order_relaxed);
-    ctx->chat_history.clear();
-    ctx->active_kv_tokens.clear();
-}
-
-bool execute_decode(
+static bool execute_decode(
     infer_ctx* ctx,
     const std::vector<llama_token>& prompt_tokens,
     bool append_to_existing_past,
     int32_t max_tokens,
-    infer_stream_cb_v2 callback,
+    infer_stream_cb callback,
     void* user_data,
     std::string* out_generated_text = nullptr
 ) {
@@ -1435,10 +885,7 @@ bool execute_decode(
     size_t prefix_len = 0;
 
     if (append_to_existing_past) {
-        const size_t current_past_sz = static_cast<size_t>(std::max(0, ctx->n_past.load(std::memory_order_relaxed)));
-        const size_t kv_bound = std::min(ctx->active_kv_tokens.size(), current_past_sz);
-
-        while (prefix_len < kv_bound &&
+        while (prefix_len < ctx->active_kv_tokens.size() &&
                prefix_len < prompt_tokens.size() &&
                ctx->active_kv_tokens[prefix_len] == prompt_tokens[prefix_len]) {
             prefix_len++;
@@ -1448,13 +895,12 @@ bool execute_decode(
             prefix_len--;
         }
 
-        if (prefix_len < current_past_sz || prefix_len < ctx->active_kv_tokens.size()) {
-            if (!safe_kv_seq_rm(ctx, 0, static_cast<int>(prefix_len), -1)) {
+        if (prefix_len < ctx->active_kv_tokens.size()) {
+            if (!safe_kv_seq_rm(ctx->lctx, 0, static_cast<int>(prefix_len), -1)) {
                 prefix_len = 0;
-            } else {
-                ctx->active_kv_tokens.resize(prefix_len);
-                ctx->n_past.store(static_cast<int>(prefix_len), std::memory_order_relaxed);
             }
+            ctx->active_kv_tokens.resize(prefix_len);
+            ctx->n_past.store(static_cast<int>(prefix_len), std::memory_order_relaxed);
         }
 
         int current_past = ctx->n_past.load(std::memory_order_relaxed);
@@ -1481,7 +927,7 @@ bool execute_decode(
                 ctx->set_error("Prompt does not fit in context even after shifting.");
                 return false;
             }
-            if (!safe_kv_seq_rm(ctx, 0, n_keep, n_keep + n_discard)) {
+            if (!safe_kv_seq_rm(ctx->lctx, 0, n_keep, n_keep + n_discard)) {
                 ctx->set_error("KV sequence shift refused by memory architecture.");
                 return false;
             }
@@ -1494,13 +940,15 @@ bool execute_decode(
                     ctx->active_kv_tokens.begin() + n_keep + n_discard
                 );
             } else if (ctx->active_kv_tokens.size() > static_cast<size_t>(n_keep)) {
-                ctx->active_kv_tokens.resize(static_cast<size_t>(n_keep));
+                ctx->active_kv_tokens.resize(n_keep);
             }
 
             ctx->n_past.store(current_past, std::memory_order_relaxed);
         }
     } else {
-        invalidate_kv(ctx);
+        llama_memory_clear(llama_get_memory(ctx->lctx), false);
+        ctx->active_kv_tokens.clear();
+        ctx->n_past.store(0, std::memory_order_relaxed);
     }
 
     if (ctx->sampler) {
@@ -1532,10 +980,10 @@ bool execute_decode(
         ~BatchGuard() { llama_batch_free(b); }
     } batch_guard{batch};
 
-    PrefillRollbackGuard prefill_guard{ctx, start_past, false};
+    PrefillRollbackGuard prefill_guard{ctx->lctx, start_past, false};
 
     if (!delta_prompt.empty()) {
-        for (size_t i = 0; i < delta_prompt.size(); ) {
+        for (size_t i = 0; i < delta_prompt.size(); i += batch.n_tokens) {
             if (ctx->abort_flag.load(std::memory_order_relaxed)) {
                 ctx->set_error("Generation aborted during prompt prefill.");
                 return false;
@@ -1545,9 +993,9 @@ bool execute_decode(
             int chunk = std::min<int>(effective_batch_cap, static_cast<int>(delta_prompt.size() - i));
 
             for (int j = 0; j < chunk; ++j) {
-                size_t idx = i + static_cast<size_t>(j);
+                size_t idx = i + j;
                 batch.token[j]     = delta_prompt[idx];
-                batch.pos[j]       = static_cast<llama_pos>(start_past + static_cast<int>(idx));
+                batch.pos[j]       = static_cast<llama_pos>(start_past + idx);
                 batch.n_seq_id[j]  = 1;
                 batch.seq_id[j][0] = 0;
                 batch.logits[j]    = (idx == delta_prompt.size() - 1);
@@ -1558,8 +1006,6 @@ bool execute_decode(
                 ctx->set_error("llama_decode failed during prompt prefill.");
                 return false;
             }
-
-            i += static_cast<size_t>(chunk);
         }
 
         ctx->active_kv_tokens.insert(ctx->active_kv_tokens.end(), delta_prompt.begin(), delta_prompt.end());
@@ -1584,28 +1030,10 @@ bool execute_decode(
     const bool track_stops = !active_stops.empty();
     bool rolled_back = false;
 
-    int32_t generated_tokens  = 0;
-    const int32_t default_cap = static_cast<int32_t>(std::min<uint32_t>(ctx->n_ctx, static_cast<uint32_t>(INT32_MAX)));
-    const int32_t token_limit = (max_tokens > 0) ? max_tokens : default_cap;
+    int32_t generated_tokens = 0;
+    const int32_t hard_cap    = static_cast<int32_t>(std::min<uint32_t>(ctx->n_ctx, 1u << 28)) * 4;
+    const int32_t token_limit = (max_tokens > 0) ? max_tokens : hard_cap;
     bool execution_success = true;
-
-    auto rollback_stop_tokens = [&](size_t stop_byte_offset) {
-        for (const auto& e : tok_log) {
-            if (e.second > stop_byte_offset) {
-                if (safe_kv_seq_rm(ctx, 0, e.first, -1)) {
-                    n_cur = e.first;
-                    if (ctx->active_kv_tokens.size() > static_cast<size_t>(n_cur)) {
-                        ctx->active_kv_tokens.resize(static_cast<size_t>(n_cur));
-                    }
-                    ctx->n_past.store(n_cur, std::memory_order_relaxed);
-                } else {
-                    n_cur = 0;
-                }
-                rolled_back = true;
-                break;
-            }
-        }
-    };
 
     while (generated_tokens < token_limit) {
         if (ctx->abort_flag.load(std::memory_order_relaxed)) {
@@ -1624,12 +1052,11 @@ bool execute_decode(
             int keep_budget = (ctx->n_keep > 0) ? ctx->n_keep : 64;
             int n_keep = std::min<int>(keep_budget, static_cast<int>(ctx->n_ctx) / 4);
             if (n_keep <= 0) n_keep = 1;
-            int n_discard = (static_cast<int>(ctx->n_ctx) - n_keep) / 2;
+            int n_discard = (ctx->n_ctx - n_keep) / 2;
             if (n_discard <= 0) n_discard = 1;
 
-            if (!safe_kv_seq_rm(ctx, 0, n_keep, n_keep + n_discard)) {
+            if (!safe_kv_seq_rm(ctx->lctx, 0, n_keep, n_keep + n_discard)) {
                 ctx->set_error("Context shift refused by memory architecture.");
-                n_cur = 0;
                 execution_success = false;
                 break;
             }
@@ -1642,7 +1069,7 @@ bool execute_decode(
                     ctx->active_kv_tokens.begin() + n_keep + n_discard
                 );
             } else if (ctx->active_kv_tokens.size() > static_cast<size_t>(n_keep)) {
-                ctx->active_kv_tokens.resize(static_cast<size_t>(n_keep));
+                ctx->active_kv_tokens.resize(n_keep);
             }
 
             if (track_stops) {
@@ -1663,8 +1090,8 @@ bool execute_decode(
         llama_token new_token_id = llama_sampler_sample(ctx->sampler, ctx->lctx, -1);
 
         if (llama_vocab_is_eog(vocab, new_token_id)) {
-            if (append_to_existing_past && n_cur > 0) {
-                batch.n_tokens     = 0;
+            if (append_to_existing_past) {
+                batch.n_tokens = 0;
                 batch.token[0]     = new_token_id;
                 batch.pos[0]       = static_cast<llama_pos>(n_cur);
                 batch.n_seq_id[0]  = 1;
@@ -1679,16 +1106,12 @@ bool execute_decode(
             break;
         }
 
-        int n_chars = llama_token_to_piece(vocab, new_token_id, piece_buf.data(), static_cast<int32_t>(piece_buf.size()), 0, false);
+      int n_chars = llama_token_to_piece(vocab, new_token_id, piece_buf.data(), piece_buf.size(), 0, false);
         if (n_chars < 0) {
-            if (n_chars == INT32_MIN) {
-                ctx->set_error("Token piece length overflow.");
-                execution_success = false;
-                break;
-            }
-            piece_buf.resize(static_cast<size_t>(-n_chars) + 1);
-            n_chars = llama_token_to_piece(vocab, new_token_id, piece_buf.data(), static_cast<int32_t>(piece_buf.size()), 0, false);
+            piece_buf.resize(-n_chars + 1);
+            n_chars = llama_token_to_piece(vocab, new_token_id, piece_buf.data(), piece_buf.size(), 0, false);
             if (n_chars < 0) {
+                // Vocabulary mapping critically failed twice; abort this token safely
                 ctx->set_error("Token piece translation failed repeatedly.");
                 execution_success = false;
                 break;
@@ -1709,16 +1132,26 @@ bool execute_decode(
                 }
 
                 if (out_buf.hit_stop() && track_stops && !rolled_back) {
-                    rollback_stop_tokens(out_buf.stop_offset());
+                    for (const auto& e : tok_log) {
+                        if (e.second > out_buf.stop_offset()) {
+                            safe_kv_seq_rm(ctx->lctx, 0, e.first, -1);
+                            n_cur = e.first;
+                            if (ctx->active_kv_tokens.size() > static_cast<size_t>(n_cur)) {
+                                ctx->active_kv_tokens.resize(n_cur);
+                            }
+                            rolled_back = true;
+                            break;
+                        }
+                    }
                 }
 
-                if (append_to_existing_past && n_cur > 0) {
+                if (append_to_existing_past) {
                     llama_token term_token = llama_vocab_eot(vocab);
                     if (term_token == LLAMA_TOKEN_NULL) {
                         term_token = llama_vocab_eos(vocab);
                     }
                     if (term_token != LLAMA_TOKEN_NULL) {
-                        batch.n_tokens     = 0;
+                        batch.n_tokens = 0;
                         batch.token[0]     = term_token;
                         batch.pos[0]       = static_cast<llama_pos>(n_cur);
                         batch.n_seq_id[0]  = 1;
@@ -1735,7 +1168,7 @@ bool execute_decode(
             }
         }
 
-        batch.n_tokens     = 0;
+        batch.n_tokens = 0;
         batch.token[0]     = new_token_id;
         batch.pos[0]       = static_cast<llama_pos>(n_cur);
         batch.n_seq_id[0]  = 1;
@@ -1757,13 +1190,13 @@ bool execute_decode(
         ctx->n_past.store(n_cur, std::memory_order_relaxed);
     }
 
-    if (generated_tokens >= token_limit && append_to_existing_past && n_cur > 0) {
+    if (generated_tokens >= token_limit && append_to_existing_past) {
         llama_token term_token = llama_vocab_eot(vocab);
         if (term_token == LLAMA_TOKEN_NULL) {
             term_token = llama_vocab_eos(vocab);
         }
         if (term_token != LLAMA_TOKEN_NULL) {
-            batch.n_tokens     = 0;
+            batch.n_tokens = 0;
             batch.token[0]     = term_token;
             batch.pos[0]       = static_cast<llama_pos>(n_cur);
             batch.n_seq_id[0]  = 1;
@@ -1780,7 +1213,17 @@ bool execute_decode(
     out_buf.flush_remaining();
 
     if (out_buf.hit_stop() && track_stops && !rolled_back) {
-        rollback_stop_tokens(out_buf.stop_offset());
+        for (const auto& e : tok_log) {
+            if (e.second > out_buf.stop_offset()) {
+                safe_kv_seq_rm(ctx->lctx, 0, e.first, -1);
+                n_cur = e.first;
+                if (ctx->active_kv_tokens.size() > static_cast<size_t>(n_cur)) {
+                    ctx->active_kv_tokens.resize(n_cur);
+                }
+                rolled_back = true;
+                break;
+            }
+        }
     }
 
     if (out_generated_text) {
@@ -1802,57 +1245,63 @@ bool execute_decode(
     return execution_success;
 }
 
-bool infer_generate_chat_internal(
+static bool infer_generate_chat_internal(
     infer_ctx* ctx,
     const infer_chat_msg* msgs,
     size_t num_msgs,
     int32_t max_tokens,
-    infer_stream_cb_v2 callback,
+    infer_stream_cb callback,
     void* user_data
 ) {
     const struct llama_vocab* vocab = llama_model_get_vocab(ctx->model);
+    const char* chat_template = llama_model_chat_template(ctx->model, nullptr);
+    if (!chat_template) {
+        ctx->set_error("Model specifies no chat template.");
+        return false;
+    }
 
-    std::vector<OwnedMsg> new_history;
-    new_history.reserve(num_msgs + 1);
+    std::vector<std::string> safe_content;
+    safe_content.reserve(num_msgs);
     for (size_t i = 0; i < num_msgs; ++i) {
-        new_history.push_back({
-            msgs[i].role,
-            neutralize_special_fast(msgs[i].content, ctx->special_lookup)
-        });
+        safe_content.push_back(neutralize_special_fast(msgs[i].content, ctx->special_lookup));
     }
 
     std::vector<struct llama_chat_message> llama_msgs;
     llama_msgs.reserve(num_msgs);
-    for (const auto& m : new_history) {
-        llama_msgs.push_back({ m.role.c_str(), m.content.c_str() });
+    for (size_t i = 0; i < num_msgs; ++i) {
+        llama_msgs.push_back({ msgs[i].role, safe_content[i].c_str() });
     }
 
-    std::string formatted;
-    if (!render_chat_template_with_fallback(ctx, llama_msgs, formatted)) {
+    int alloc_size = llama_chat_apply_template(chat_template, llama_msgs.data(), llama_msgs.size(), true, nullptr, 0);
+    if (alloc_size <= 0) {
+        ctx->set_error("Chat template formatting failed.");
         return false;
     }
 
-    bool add_bos = want_bos(vocab, formatted.c_str());
-    std::vector<llama_token> prompt_tokens;
-    if (!tokenize_checked(vocab, formatted.c_str(), formatted.size(), add_bos, true, &prompt_tokens) ||
-        prompt_tokens.empty()) {
+    std::vector<char> formatted(alloc_size + 1, '\0');
+    int written = llama_chat_apply_template(chat_template, llama_msgs.data(), llama_msgs.size(), true, formatted.data(), formatted.size());
+    if (written < 0) {
+        ctx->set_error("Chat template failed to render prompt.");
+        return false;
+    }
+
+    bool add_bos = want_bos(vocab, formatted.data());
+    int n_prompt_tokens = -llama_tokenize(vocab, formatted.data(), written, nullptr, 0, add_bos, true);
+    if (n_prompt_tokens <= 0) {
+        ctx->set_error("Tokenization calculation failed.");
+        return false;
+    }
+
+    std::vector<llama_token> prompt_tokens(n_prompt_tokens);
+    int real_tokens = llama_tokenize(vocab, formatted.data(), written, prompt_tokens.data(), prompt_tokens.size(), add_bos, true);
+    if (real_tokens < 0) {
         ctx->set_error("Failed to tokenize rendered chat prompt.");
         return false;
     }
+    prompt_tokens.resize(real_tokens);
 
-    std::string generated_response;
-    bool res = execute_decode(ctx, prompt_tokens, true, max_tokens, callback, user_data, &generated_response);
-    if (ctx->n_past.load(std::memory_order_relaxed) > 0) {
-        if (res) {
-            std::string safe_response = neutralize_special_fast(generated_response.c_str(), ctx->special_lookup);
-            new_history.push_back({ "assistant", std::move(safe_response) });
-        }
-        ctx->chat_history = std::move(new_history);
-    }
-    return res;
+    return execute_decode(ctx, prompt_tokens, false, max_tokens, callback, user_data);
 }
-
-} // anonymous namespace
 
 /* ========================================================================== */
 /* Public API Implementation                                                  */
@@ -1865,9 +1314,11 @@ uint32_t infer_version(void) {
 }
 
 void infer_set_log_callback(infer_log_cb callback, void* user_data) {
-    std::lock_guard<std::mutex> lock(g_log_mutex);
-    g_user_log_cb   = callback;
-    g_user_log_data = user_data;
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        g_user_log_cb   = callback;
+        g_user_log_data = user_data;
+    }
     if (callback) {
         llama_log_set(internal_ggml_log, nullptr);
     } else {
@@ -1882,115 +1333,36 @@ infer_sampler_params infer_sampler_default_params(void) {
     p.top_p          = 0.90f;
     p.top_k          = 40;
     p.min_p          = 0.05f;
-    p.repeat_penalty = 1.00f;
+    p.repeat_penalty = 1.10f;
     p.repeat_last_n  = 64;
     p.seed           = 0;
     return p;
 }
 
-infer_model_params infer_model_default_params(void) {
-    infer_model_params p{};
-    p.struct_size         = sizeof(infer_model_params);
-    p.requested_ctx       = 0;
-    p.n_gpu_layers        = -1;
-    p.use_mmap            = true;
-    p.use_mlock           = false;
-    p.flash_attn          = false;
-    p.kv_type_k           = INFER_KV_TYPE_F16;
-    p.kv_type_v           = INFER_KV_TYPE_F16;
-    p.allow_ctx_reduction = false;
-    p.chat_template       = nullptr;
-    return p;
-}
-
-infer_ctx* infer_init_ex(char* err_buf, size_t err_buf_size) {
-    auto write_err = [err_buf, err_buf_size](const char* msg) {
-        if (err_buf && err_buf_size > 0 && msg) {
-            size_t len = std::min(err_buf_size - 1, std::strlen(msg));
-            std::memcpy(err_buf, msg, len);
-            err_buf[len] = '\0';
-        }
-    };
-
-    if (err_buf && err_buf_size > 0) {
-        err_buf[0] = '\0';
-    }
-
+infer_ctx* infer_init(void) {
     bool reffed = false;
     infer_ctx* ctx = nullptr;
     try {
-        std::string backend_err;
-        if (!ref_llama_backend(backend_err)) {
-            write_err(backend_err.c_str());
-            return nullptr;
-        }
+        if (!ref_llama_backend()) return nullptr;
         reffed = true;
         ctx = new (std::nothrow) infer_ctx();
         if (!ctx) {
             unref_llama_backend();
-            write_err("Out of memory allocating infer_ctx.");
             return nullptr;
         }
         ctx->sampler_params = infer_sampler_default_params();
         return ctx;
-    } catch (const std::exception& e) {
-        if (ctx) delete ctx;
-        if (reffed) unref_llama_backend();
-        write_err(e.what());
-        return nullptr;
     } catch (...) {
         if (ctx) delete ctx;
         if (reffed) unref_llama_backend();
-        write_err("Unknown exception in infer_init_ex.");
         return nullptr;
     }
 }
 
-infer_ctx* infer_init(void) {
-    return infer_init_ex(nullptr, 0);
-}
+bool infer_load_model(infer_ctx* ctx, const char* path, uint32_t requested_ctx) {
+    if (!ctx || !path) return false;
 
-bool infer_unload_model(infer_ctx* ctx) {
-    if (!ctx) return false;
-    GenAcquireGuard gen_guard(ctx);
-    if (!gen_guard.acquired) {
-        ctx->set_error("Cannot unload model while context is busy.");
-        return false;
-    }
-
-    try {
-        std::lock_guard<std::mutex> lock(ctx->ctx_mutex);
-        ctx->clear_error();
-        free_model_resources_locked(ctx);
-        return true;
-    } catch (const std::exception& e) {
-        ctx->set_error(e.what());
-        return false;
-    } catch (...) {
-        ctx->set_error("Unknown exception in infer_unload_model.");
-        return false;
-    }
-}
-
-
-
-
-bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_params* params) {
-    if (!ctx || !path || !params) {
-        if (ctx) ctx->set_error("Null path or parameters in infer_load_model_ex.");
-        return false;
-    }
-    if (params->struct_size == 0) {
-        ctx->set_error("Invalid infer_model_params struct_size (must be non-zero).");
-        return false;
-    }
-
-    infer_model_params mparams = infer_model_default_params();
-    size_t copy_sz = std::min<size_t>(params->struct_size, sizeof(infer_model_params));
-    std::memcpy(&mparams, params, copy_sz);
-    mparams.struct_size = sizeof(infer_model_params);
-
-    if (mparams.requested_ctx != 0 && mparams.requested_ctx < 256) {
+    if (requested_ctx != 0 && requested_ctx < 256) {
         ctx->set_error("Requested context size too small (minimum 256).");
         return false;
     }
@@ -2005,128 +1377,53 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
         std::lock_guard<std::mutex> lock(ctx->ctx_mutex);
         ctx->clear_error();
 
-        // 1. Free old model first so GPU VRAM reading is 100% accurate
-        free_model_resources_locked(ctx);
+        // FIX 12: free the previous model BEFORE loading the new one (peak = 1x, not 2x).
+        if (ctx->sampler) { llama_sampler_free(ctx->sampler); ctx->sampler = nullptr; ctx->penalty_smpl = nullptr; }
+        if (ctx->lctx)    { llama_free(ctx->lctx);            ctx->lctx = nullptr; }
+        if (ctx->model)   { llama_model_free(ctx->model);     ctx->model = nullptr; }
+        ctx->n_past.store(0, std::memory_order_relaxed);
+        ctx->n_keep = 0;
+        ctx->chat_history.clear();
+        ctx->active_kv_tokens.clear();
 
-        // 2. Measure GGUF file size on disk and free GPU VRAM for Hybrid GPU + RAM split
-        uint64_t model_file_bytes = 0;
-        {
-            ScopedFile mf(open_file_utf8(path, "rb"));
-            if (mf) {
-                file_size_64(mf.get(), model_file_bytes);
-            }
-        }
-
-        uint64_t free_vram = 0;
-        size_t dev_count = ggml_backend_dev_count();
-        for (size_t i = 0; i < dev_count; ++i) {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            auto dtype = ggml_backend_dev_type(dev);
-            if (dtype == GGML_BACKEND_DEVICE_TYPE_GPU || dtype == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                size_t df = 0, dt = 0;
-                ggml_backend_dev_memory(dev, &df, &dt);
-                free_vram += static_cast<uint64_t>(df);
-            }
-        }
-
-        int32_t target_gpu_layers = (mparams.n_gpu_layers < 0) ? 999 : mparams.n_gpu_layers;
-
-        // INCREASED RESERVE: Prevents Windows WDDM from paging VRAM to system RAM (which causes the freeze)
-        constexpr uint64_t KV_AND_COMPUTE_VRAM_RESERVE = 1536ULL * 1024ULL * 1024ULL; // 1.5 GB reserve
-        
-        if (mparams.n_gpu_layers < 0 && free_vram > 0 && model_file_bytes > 0) {
-            if (free_vram <= KV_AND_COMPUTE_VRAM_RESERVE) {
-                target_gpu_layers = 0; // Not enough free VRAM; safely fall back to CPU/System RAM
-            } else {
-                uint64_t vram_budget_for_weights = free_vram - KV_AND_COMPUTE_VRAM_RESERVE;
-                if (model_file_bytes > vram_budget_for_weights) {
-                    double fit_ratio = static_cast<double>(vram_budget_for_weights) / static_cast<double>(model_file_bytes);
-                    // FIXED ESTIMATE: Llama 3.2 3B has 28 layers. Overestimating pushes too much to GPU.
-                    int32_t est_total_layers = (model_file_bytes > 4800ULL * 1024ULL * 1024ULL) ? 32 : 28;
-                    target_gpu_layers = std::max<int32_t>(1, static_cast<int32_t>(fit_ratio * est_total_layers));
-                }
-            }
-        }
-
-        struct llama_model_params llama_mparams = llama_model_default_params();
-        llama_mparams.n_gpu_layers = target_gpu_layers;
-        apply_model_load_params(llama_mparams, mparams.use_mmap, mparams.use_mlock);
+        struct llama_model_params model_params = llama_model_default_params();
+        model_params.n_gpu_layers = 999;
 
         std::unique_ptr<llama_model, decltype(&llama_model_free)> new_model(
-            llama_model_load_from_file(path, llama_mparams), &llama_model_free);
+            llama_model_load_from_file(path, model_params), &llama_model_free);
         if (!new_model) {
             ctx->set_error("Failed to load model from path: " + std::string(path));
             return false;
         }
 
-        const enum ggml_type type_k = map_kv_type(mparams.kv_type_k);
-        const enum ggml_type type_v = map_kv_type(mparams.kv_type_v);
-
-        uint32_t safe_ctx = calculate_safe_n_ctx(
-            new_model.get(), mparams.requested_ctx, llama_mparams.n_gpu_layers, type_k, type_v);
-
-        if (mparams.requested_ctx > 0 && safe_ctx < mparams.requested_ctx && !mparams.allow_ctx_reduction) {
-            ctx->set_error("Requested context size (" + std::to_string(mparams.requested_ctx) +
-                           ") exceeds model training length or available memory budget (" +
-                           std::to_string(safe_ctx) + ").");
-            return false;
-        }
-
+        uint32_t safe_ctx = calculate_safe_n_ctx(new_model.get(), requested_ctx);
         if (safe_ctx < 256) {
             ctx->set_error("Context size too small (minimum 256).");
             return false;
         }
 
-        const bool has_gpu = (llama_mparams.n_gpu_layers != 0) && infer_has_real_gpu();
-        const int32_t threads_gen   = pick_threads(has_gpu, false);
-        const int32_t threads_batch = pick_threads(has_gpu, true);
+        struct llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx          = safe_ctx;
+        ctx_params.n_batch        = std::min<uint32_t>(safe_ctx, DEFAULT_BATCH_CAP);
+        ctx_params.n_seq_max      = 2;
+        ctx_params.kv_unified     = true;
 
-        std::unique_ptr<llama_context, decltype(&llama_free)> new_lctx(nullptr, &llama_free);
-        uint32_t candidate_ctx = safe_ctx;
+        const bool has_gpu = infer_has_real_gpu();
+        ctx_params.n_threads       = pick_threads(has_gpu, false);
+        ctx_params.n_threads_batch = pick_threads(has_gpu, true);
 
-        while (candidate_ctx >= 256) {
-            struct llama_context_params ctx_params = llama_context_default_params();
-            ctx_params.n_ctx           = candidate_ctx;
-            ctx_params.n_batch         = std::min<uint32_t>(candidate_ctx, DEFAULT_BATCH_CAP);
-            ctx_params.n_seq_max       = 1;
-            ctx_params.kv_unified      = true;
-            ctx_params.type_k          = type_k;
-            ctx_params.type_v          = type_v;
-            ctx_params.n_threads       = threads_gen;
-            ctx_params.n_threads_batch = threads_batch;
-            apply_flash_attn_param(ctx_params, mparams.flash_attn);
-
-            new_lctx.reset(llama_init_from_model(new_model.get(), ctx_params));
-            if (new_lctx) {
-                break;
-            }
-
-            if (mparams.requested_ctx > 0 && !mparams.allow_ctx_reduction) {
-                break;
-            }
-            if (candidate_ctx == 256) {
-                break;
-            }
-            candidate_ctx = std::max<uint32_t>(256, candidate_ctx / 2);
-        }
-
+        std::unique_ptr<llama_context, decltype(&llama_free)> new_lctx(
+            llama_init_from_model(new_model.get(), ctx_params), &llama_free);
         if (!new_lctx) {
-            ctx->set_error("Failed to initialize llama_context for requested context size.");
-            return false;
-        }
-
-        const uint32_t new_n_ctx = llama_n_ctx_seq(new_lctx.get());
-        if (mparams.requested_ctx > 0 && new_n_ctx < mparams.requested_ctx && !mparams.allow_ctx_reduction) {
-            ctx->set_error("Allocated context size (" + std::to_string(new_n_ctx) +
-                           ") is smaller than explicitly requested size (" +
-                           std::to_string(mparams.requested_ctx) + ").");
+            ctx->set_error("Failed to initialize llama_context.");
             return false;
         }
 
         std::string err;
         struct llama_sampler* new_pen = nullptr;
-        UniqueSampler new_sampler = create_sampler(
-            ctx->sampler_params, new_model.get(), new_n_ctx, ctx->grammar_gbnf, err, &new_pen);
+        std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> new_sampler(
+            create_sampler(ctx->sampler_params, new_model.get(), ctx->grammar_gbnf, err, &new_pen),
+            &llama_sampler_free);
         if (!new_sampler) {
             ctx->set_error(err);
             return false;
@@ -2136,42 +1433,38 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
         SpecialTokenLookup new_lookup;
         new_lookup.build(specials);
 
+        const uint32_t new_n_ctx = llama_n_ctx_seq(new_lctx.get());
+
+        if (ctx->sampler) llama_sampler_free(ctx->sampler);
+        if (ctx->lctx)    llama_free(ctx->lctx);
+        if (ctx->model)   llama_model_free(ctx->model);
+
         ctx->model          = new_model.release();
         ctx->lctx           = new_lctx.release();
         ctx->sampler        = new_sampler.release();
         ctx->penalty_smpl   = new_pen;
+        ctx->special_texts  = std::move(specials);
         ctx->special_lookup = std::move(new_lookup);
         ctx->n_ctx          = new_n_ctx;
         ctx->n_past.store(0, std::memory_order_relaxed);
         ctx->n_keep         = 0;
-        if (mparams.chat_template) {
-            ctx->custom_chat_template = mparams.chat_template;
-        }
+        ctx->chat_history.clear();
+        ctx->active_kv_tokens.clear();
 
         return true;
     } catch (const std::exception& e) {
         ctx->set_error(e.what());
         return false;
     } catch (...) {
-        ctx->set_error("Unknown exception in infer_load_model_ex.");
+        ctx->set_error("Unknown exception in infer_load_model.");
         return false;
     }
 }
 
-
-
-
-bool infer_load_model(infer_ctx* ctx, const char* path, uint32_t requested_ctx) {
-    infer_model_params params = infer_model_default_params();
-    params.requested_ctx       = requested_ctx;
-    params.allow_ctx_reduction = (requested_ctx == 0);
-    return infer_load_model_ex(ctx, path, &params);
-}
-
 bool infer_set_sampler(infer_ctx* ctx, const infer_sampler_params* params) {
     if (!ctx || !params) return false;
-    if (params->struct_size == 0) {
-        ctx->set_error("Invalid infer_sampler_params struct_size (must be non-zero).");
+    if (params->struct_size != 0 && params->struct_size != sizeof(infer_sampler_params)) {
+        ctx->set_error("Invalid infer_sampler_params struct_size.");
         return false;
     }
 
@@ -2183,26 +1476,20 @@ bool infer_set_sampler(infer_ctx* ctx, const infer_sampler_params* params) {
 
     try {
         std::lock_guard<std::mutex> lock(ctx->ctx_mutex);
-        infer_sampler_params safe_params{};
-        size_t copy_sz = std::min<size_t>(params->struct_size, sizeof(infer_sampler_params));
-        std::memcpy(&safe_params, params, copy_sz);
-        safe_params.struct_size = sizeof(infer_sampler_params);
-
         std::string err;
         struct llama_sampler* new_pen = nullptr;
-        UniqueSampler new_sampler = create_sampler(
-            safe_params, ctx->model, ctx->n_ctx, ctx->grammar_gbnf, err, &new_pen);
+        struct llama_sampler* new_sampler = create_sampler(*params, ctx->model, ctx->grammar_gbnf, err, &new_pen);
         if (!new_sampler) {
             ctx->set_error(err);
             return false;
         }
 
-        if (ctx->sampler) {
+      if (ctx->sampler) {
             llama_sampler_free(ctx->sampler);
         }
-        ctx->sampler        = new_sampler.release();
+        ctx->sampler        = new_sampler;
         ctx->penalty_smpl   = new_pen;
-        ctx->sampler_params = safe_params;
+        ctx->sampler_params = *params;
         return true;
     } catch (const std::exception& e) {
         ctx->set_error(e.what());
@@ -2213,55 +1500,23 @@ bool infer_set_sampler(infer_ctx* ctx, const infer_sampler_params* params) {
     }
 }
 
-bool infer_set_chat_template(infer_ctx* ctx, const char* custom_template) {
-    if (!ctx) return false;
-    GenAcquireGuard gen_guard(ctx);
-    if (!gen_guard.acquired) {
-        ctx->set_error("Cannot change chat template while context is busy.");
-        return false;
-    }
-
-    try {
-        std::lock_guard<std::mutex> lock(ctx->ctx_mutex);
-        ctx->custom_chat_template = custom_template ? custom_template : "";
-        return true;
-    } catch (const std::exception& e) {
-        ctx->set_error(e.what());
-        return false;
-    } catch (...) {
-        ctx->set_error("Unknown exception in infer_set_chat_template.");
-        return false;
-    }
-}
-
 bool infer_get_model_info(infer_ctx* ctx, infer_model_info* out_info) {
     if (!ctx || !out_info) return false;
-    if (out_info->struct_size == 0) {
-        ctx->set_error("Invalid infer_model_info struct_size (must be non-zero).");
-        return false;
-    }
-
     try {
         std::lock_guard<std::mutex> lock(ctx->ctx_mutex);
-        if (!ctx->model || !ctx->lctx) {
-            ctx->set_error("No active model loaded.");
-            return false;
-        }
+        if (!ctx->model || !ctx->lctx) return false;
 
         const struct llama_vocab* vocab = llama_model_get_vocab(ctx->model);
-        infer_model_info tmp{};
-        tmp.struct_size  = sizeof(infer_model_info);
-        tmp.n_ctx_train  = static_cast<uint32_t>(llama_model_n_ctx_train(ctx->model));
-        tmp.n_embd       = static_cast<uint32_t>(llama_model_n_embd(ctx->model));
-        tmp.n_layer      = static_cast<uint32_t>(llama_model_n_layer(ctx->model));
-        tmp.n_head       = static_cast<uint32_t>(llama_model_n_head(ctx->model));
-        tmp.vocab_size   = vocab ? static_cast<uint32_t>(llama_vocab_n_tokens(vocab)) : 0;
-        tmp.n_ctx_active = ctx->n_ctx;
+        out_info->struct_size  = sizeof(infer_model_info);
+        out_info->n_ctx_train  = static_cast<uint32_t>(llama_model_n_ctx_train(ctx->model));
+        out_info->n_embd       = static_cast<uint32_t>(llama_model_n_embd(ctx->model));
+        out_info->n_layer      = static_cast<uint32_t>(llama_model_n_layer(ctx->model));
+        out_info->n_head       = static_cast<uint32_t>(llama_model_n_head(ctx->model));
+        out_info->vocab_size   = vocab ? static_cast<uint32_t>(llama_vocab_n_tokens(vocab)) : 0;
+        out_info->n_ctx_active = ctx->n_ctx;
 
-        llama_model_desc(ctx->model, tmp.description, sizeof(tmp.description));
-
-        size_t copy_sz = std::min<size_t>(out_info->struct_size, sizeof(infer_model_info));
-        std::memcpy(out_info, &tmp, copy_sz);
+        std::memset(out_info->description, 0, sizeof(out_info->description));
+        llama_model_desc(ctx->model, out_info->description, sizeof(out_info->description));
         return true;
     } catch (...) {
         return false;
@@ -2272,13 +1527,13 @@ size_t infer_get_last_error(infer_ctx* ctx, char* out_buf, size_t buf_size) {
     if (!ctx) return 0;
     try {
         std::lock_guard<std::mutex> lock(ctx->err_mutex);
-        const size_t full_len = ctx->last_error.size();
-        if (out_buf && buf_size > 0) {
-            size_t copy_len = std::min(buf_size - 1, full_len);
-            std::memcpy(out_buf, ctx->last_error.c_str(), copy_len);
-            out_buf[copy_len] = '\0';
+        if (!out_buf || buf_size == 0) {
+            return ctx->last_error.size();
         }
-        return full_len;
+        size_t copy_len = std::min(buf_size - 1, ctx->last_error.size());
+        std::memcpy(out_buf, ctx->last_error.c_str(), copy_len);
+        out_buf[copy_len] = '\0';
+        return copy_len;
     } catch (...) {
         return 0;
     }
@@ -2290,6 +1545,10 @@ bool infer_last_success(infer_ctx* ctx) {
 
 int32_t infer_tokenize_count(infer_ctx* ctx, const char* text, bool add_special) {
     if (!ctx || !text) return -1;
+    size_t text_len = std::strlen(text);
+    if (text_len >= static_cast<size_t>(INT32_MAX)) {
+        return -1;
+    }
 
     try {
         std::lock_guard<std::mutex> lock(ctx->ctx_mutex);
@@ -2297,12 +1556,8 @@ int32_t infer_tokenize_count(infer_ctx* ctx, const char* text, bool add_special)
         const struct llama_vocab* vocab = llama_model_get_vocab(ctx->model);
         if (!vocab) return -1;
 
-        std::string safe_text = neutralize_special_fast(text, ctx->special_lookup);
-        int32_t count = 0;
-        if (!tokenize_checked(vocab, safe_text.c_str(), safe_text.size(), add_special, true, nullptr, &count)) {
-            return -1;
-        }
-        return count;
+        int n = llama_tokenize(vocab, text, static_cast<int32_t>(text_len), nullptr, 0, add_special, true);
+        return (n < 0) ? -n : n;
     } catch (...) {
         return -1;
     }
@@ -2310,16 +1565,11 @@ int32_t infer_tokenize_count(infer_ctx* ctx, const char* text, bool add_special)
 
 uint32_t infer_get_kv_cache_token_count(infer_ctx* ctx) {
     if (!ctx) return 0;
-    return static_cast<uint32_t>(std::max(0, ctx->n_past.load(std::memory_order_relaxed)));
+    return static_cast<uint32_t>(ctx->n_past.load(std::memory_order_relaxed));
 }
 
 bool infer_set_stop_sequences(infer_ctx* ctx, const char* const* stop_words, size_t num_words) {
     if (!ctx) return false;
-    if (num_words > 0 && !stop_words) {
-        ctx->set_error("stop_words pointer cannot be null when num_words > 0.");
-        return false;
-    }
-
     GenAcquireGuard gen_guard(ctx);
     if (!gen_guard.acquired) {
         ctx->set_error("Cannot change stop sequences while context is busy.");
@@ -2327,23 +1577,19 @@ bool infer_set_stop_sequences(infer_ctx* ctx, const char* const* stop_words, siz
     }
 
     try {
-        std::vector<std::string> validated;
-        validated.reserve(num_words);
-        for (size_t i = 0; i < num_words; ++i) {
-            if (!stop_words[i]) {
-                ctx->set_error("Stop sequence entry cannot be null.");
-                return false;
-            }
-            size_t slen = std::strlen(stop_words[i]);
-            if (slen == 0 || slen > 256) {
-                ctx->set_error("Stop sequence length must be between 1 and 256 bytes.");
-                return false;
-            }
-            validated.emplace_back(stop_words[i], slen);
-        }
-
         std::lock_guard<std::mutex> lock(ctx->ctx_mutex);
-        ctx->stop_words = std::move(validated);
+        ctx->stop_words.clear();
+        if (stop_words && num_words > 0) {
+            for (size_t i = 0; i < num_words; ++i) {
+                if (stop_words[i]) {
+                    size_t slen = std::strlen(stop_words[i]);
+                    // Cap stop sequence length to 256 bytes to prevent memory bloat
+                    if (slen > 0 && slen <= 256) {
+                        ctx->stop_words.emplace_back(stop_words[i]);
+                    }
+                }
+            }
+        }
         return true;
     } catch (const std::exception& e) {
         ctx->set_error(e.what());
@@ -2373,8 +1619,7 @@ bool infer_set_grammar(infer_ctx* ctx, const char* grammar_gbnf) {
 
         std::string err;
         struct llama_sampler* new_pen = nullptr;
-        UniqueSampler new_sampler = create_sampler(
-            ctx->sampler_params, ctx->model, ctx->n_ctx, new_grammar, err, &new_pen);
+        struct llama_sampler* new_sampler = create_sampler(ctx->sampler_params, ctx->model, new_grammar, err, &new_pen);
         if (!new_sampler) {
             ctx->set_error(err);
             return false;
@@ -2383,7 +1628,7 @@ bool infer_set_grammar(infer_ctx* ctx, const char* grammar_gbnf) {
         if (ctx->sampler) {
             llama_sampler_free(ctx->sampler);
         }
-        ctx->sampler      = new_sampler.release();
+        ctx->sampler      = new_sampler;
         ctx->penalty_smpl = new_pen;
         ctx->grammar_gbnf = std::move(new_grammar);
         return true;
@@ -2396,29 +1641,27 @@ bool infer_set_grammar(infer_ctx* ctx, const char* grammar_gbnf) {
     }
 }
 
-bool infer_memory_clear(infer_ctx* ctx) {
-    if (!ctx) return false;
+void infer_memory_clear(infer_ctx* ctx) {
+    if (!ctx) return;
     GenAcquireGuard gen_guard(ctx);
     if (!gen_guard.acquired) {
         ctx->set_error("Cannot clear memory while context is busy.");
-        return false;
+        return;
     }
 
     try {
         std::lock_guard<std::mutex> lock(ctx->ctx_mutex);
-        ctx->clear_error();
-        invalidate_kv(ctx);
+        if (ctx->lctx) {
+            llama_memory_clear(llama_get_memory(ctx->lctx), false);
+        }
         if (ctx->sampler) {
             llama_sampler_reset(ctx->sampler);
         }
+        ctx->n_past.store(0, std::memory_order_relaxed);
+        ctx->n_keep = 0;
         ctx->chat_history.clear();
-        return true;
-    } catch (const std::exception& e) {
-        ctx->set_error(e.what());
-        return false;
+        ctx->active_kv_tokens.clear();
     } catch (...) {
-        ctx->set_error("Unknown exception in infer_memory_clear.");
-        return false;
     }
 }
 
@@ -2438,13 +1681,8 @@ bool infer_state_save(infer_ctx* ctx, const char* filepath) {
         }
 
         size_t state_size = llama_state_get_size(ctx->lctx);
-        if (state_size == 0 || static_cast<uint64_t>(state_size) > MAX_STATE_FILE_SIZE) {
+        if (state_size == 0 || state_size > MAX_STATE_FILE_SIZE) {
             ctx->set_error("Invalid state size retrieved from context.");
-            return false;
-        }
-
-        if (ctx->active_kv_tokens.size() > UINT32_MAX || ctx->chat_history.size() > UINT32_MAX) {
-            ctx->set_error("History or token count exceeds serialization limit.");
             return false;
         }
 
@@ -2460,36 +1698,26 @@ bool infer_state_save(infer_ctx* ctx, const char* filepath) {
 
         std::vector<uint8_t> hist_buf;
         uint32_t active_tok_count = static_cast<uint32_t>(ctx->active_kv_tokens.size());
-        uint32_t msg_count        = static_cast<uint32_t>(ctx->chat_history.size());
+        uint32_t msg_count = static_cast<uint32_t>(ctx->chat_history.size());
 
         auto append_bytes = [&hist_buf](const void* src, size_t len) {
-            const auto* p = static_cast<const uint8_t*>(src);
+            const uint8_t* p = static_cast<const uint8_t*>(src);
             hist_buf.insert(hist_buf.end(), p, p + len);
         };
 
         append_bytes(&active_tok_count, sizeof(active_tok_count));
         if (active_tok_count > 0) {
-            append_bytes(ctx->active_kv_tokens.data(), static_cast<size_t>(active_tok_count) * sizeof(llama_token));
+            append_bytes(ctx->active_kv_tokens.data(), active_tok_count * sizeof(llama_token));
         }
 
         append_bytes(&msg_count, sizeof(msg_count));
         for (const auto& msg : ctx->chat_history) {
-            if (msg.role.size() > UINT32_MAX || msg.content.size() > UINT32_MAX) {
-                ctx->set_error("Chat message length exceeds uint32_t limit.");
-                return false;
-            }
             uint32_t rlen = static_cast<uint32_t>(msg.role.size());
             uint32_t clen = static_cast<uint32_t>(msg.content.size());
             append_bytes(&rlen, sizeof(rlen));
             append_bytes(msg.role.data(), rlen);
             append_bytes(&clen, sizeof(clen));
             append_bytes(msg.content.data(), clen);
-        }
-
-        if (hist_buf.size() > UINT32_MAX ||
-            static_cast<uint64_t>(kv_buffer.size()) + static_cast<uint64_t>(hist_buf.size()) > MAX_STATE_FILE_SIZE) {
-            ctx->set_error("Serialized history size exceeds state file limits.");
-            return false;
         }
 
         std::string temp_filepath = make_tmp_path(filepath);
@@ -2506,20 +1734,15 @@ bool infer_state_save(infer_ctx* ctx, const char* filepath) {
         header.magic         = STATE_MAGIC;
         header.version       = STATE_VERSION;
         header.n_ctx         = ctx->n_ctx;
-        header.n_past        = static_cast<uint32_t>(std::max(0, ctx->n_past.load(std::memory_order_relaxed)));
+        header.n_past        = static_cast<uint32_t>(ctx->n_past.load(std::memory_order_relaxed));
         header.vocab_size    = vocab_size;
         header.n_embd        = static_cast<uint32_t>(llama_model_n_embd(ctx->model));
         header.n_layer       = static_cast<uint32_t>(llama_model_n_layer(ctx->model));
         header.n_head        = static_cast<uint32_t>(llama_model_n_head(ctx->model));
         header.fingerprint   = compute_model_fingerprint(ctx->model);
-        header.payload_crc   = 0;
+        header.payload_crc   = kv_buffer.empty() ? 0 : compute_crc32(kv_buffer.data(), kv_buffer.size());
         header.history_bytes = static_cast<uint32_t>(hist_buf.size());
-        header.data_size     = static_cast<uint64_t>(kv_buffer.size()) + static_cast<uint64_t>(hist_buf.size());
-
-        uint32_t crc = update_crc32(0, &header, sizeof(header));
-        crc = update_crc32(crc, kv_buffer.data(), kv_buffer.size());
-        crc = update_crc32(crc, hist_buf.data(), hist_buf.size());
-        header.payload_crc = crc;
+        header.data_size     = static_cast<uint64_t>(kv_buffer.size() + hist_buf.size());
 
         if (std::fwrite(&header, sizeof(header), 1, f.get()) != 1 ||
             (!kv_buffer.empty() && std::fwrite(kv_buffer.data(), 1, kv_buffer.size(), f.get()) != kv_buffer.size()) ||
@@ -2538,8 +1761,8 @@ bool infer_state_save(infer_ctx* ctx, const char* filepath) {
         int wtmp_len = MultiByteToWideChar(CP_UTF8, 0, temp_filepath.c_str(), -1, nullptr, 0);
         int wdst_len = MultiByteToWideChar(CP_UTF8, 0, filepath, -1, nullptr, 0);
         if (wtmp_len > 0 && wdst_len > 0) {
-            std::vector<wchar_t> wtmp(static_cast<size_t>(wtmp_len));
-            std::vector<wchar_t> wdst(static_cast<size_t>(wdst_len));
+            std::vector<wchar_t> wtmp(wtmp_len);
+            std::vector<wchar_t> wdst(wdst_len);
             MultiByteToWideChar(CP_UTF8, 0, temp_filepath.c_str(), -1, wtmp.data(), wtmp_len);
             MultiByteToWideChar(CP_UTF8, 0, filepath, -1, wdst.data(), wdst_len);
             rename_ok = (MoveFileExW(wtmp.data(), wdst.data(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0);
@@ -2621,14 +1844,14 @@ bool infer_state_load(infer_ctx* ctx, const char* filepath) {
         }
 
         uint64_t kv_bytes = header.data_size - header.history_bytes;
-        if (kv_bytes > static_cast<uint64_t>(SIZE_MAX)) {
-            ctx->set_error("State file KV payload exceeds addressable memory.");
+        std::vector<uint8_t> kv_buffer(kv_bytes);
+        if (kv_bytes > 0 && std::fread(kv_buffer.data(), 1, kv_bytes, f.get()) != kv_bytes) {
+            ctx->set_error("Corrupted or truncated state payload in file.");
             return false;
         }
 
-        std::vector<uint8_t> kv_buffer(static_cast<size_t>(kv_bytes));
-        if (kv_bytes > 0 && std::fread(kv_buffer.data(), 1, static_cast<size_t>(kv_bytes), f.get()) != static_cast<size_t>(kv_bytes)) {
-            ctx->set_error("Corrupted or truncated state payload in file.");
+        if (kv_bytes > 0 && compute_crc32(kv_buffer.data(), kv_bytes) != header.payload_crc) {
+            ctx->set_error("State payload CRC32 checksum mismatch.");
             return false;
         }
 
@@ -2638,19 +1861,6 @@ bool infer_state_load(infer_ctx* ctx, const char* filepath) {
                 ctx->set_error("Corrupted chat history payload in state file.");
                 return false;
             }
-        }
-
-        const uint32_t expected_crc = header.payload_crc;
-        StateFileHeader header_for_crc = header;
-        header_for_crc.payload_crc = 0;
-
-        uint32_t computed_crc = update_crc32(0, &header_for_crc, sizeof(header_for_crc));
-        computed_crc = update_crc32(computed_crc, kv_buffer.data(), kv_buffer.size());
-        computed_crc = update_crc32(computed_crc, hist_buf.data(), hist_buf.size());
-
-        if (computed_crc != expected_crc) {
-            ctx->set_error("State file CRC32 checksum mismatch.");
-            return false;
         }
 
         std::vector<llama_token> restored_kv;
@@ -2674,7 +1884,7 @@ bool infer_state_load(infer_ctx* ctx, const char* filepath) {
             }
             if (active_tok_count > 0) {
                 restored_kv.resize(active_tok_count);
-                if (!read_bytes(restored_kv.data(), static_cast<size_t>(active_tok_count) * sizeof(llama_token))) {
+                if (!read_bytes(restored_kv.data(), active_tok_count * sizeof(llama_token))) {
                     ctx->set_error("Truncated active tokens in state file.");
                     return false;
                 }
@@ -2692,35 +1902,26 @@ bool infer_state_load(infer_ctx* ctx, const char* filepath) {
                     return false;
                 }
                 std::string r(rlen, '\0');
-                if (!read_bytes(&r[0], rlen)) {
-                    ctx->set_error("Truncated message role in state file.");
-                    return false;
-                }
-                if (!is_valid_role(r.c_str())) {
-                    ctx->set_error("Invalid message role in state file.");
-                    return false;
-                }
+                if (!read_bytes(&r[0], rlen)) return false;
 
                 if (!read_bytes(&clen, sizeof(clen)) || clen > static_cast<size_t>(end - ptr)) {
                     ctx->set_error("Corrupted content length in state file.");
                     return false;
                 }
                 std::string c(clen, '\0');
-                if (!read_bytes(&c[0], clen)) {
-                    ctx->set_error("Truncated message content in state file.");
-                    return false;
-                }
-                c = neutralize_special_fast(c.c_str(), ctx->special_lookup);
+                if (!read_bytes(&c[0], clen)) return false;
 
                 restored_history.push_back({ std::move(r), std::move(c) });
             }
         }
 
         size_t loaded = llama_state_set_data(ctx->lctx, kv_buffer.data(), kv_buffer.size());
-        if (loaded != static_cast<size_t>(kv_bytes)) {
-            invalidate_kv(ctx);
+        if (loaded != kv_bytes) {
+            llama_memory_clear(llama_get_memory(ctx->lctx), false);
             if (ctx->sampler) llama_sampler_reset(ctx->sampler);
+            ctx->n_past.store(0, std::memory_order_relaxed);
             ctx->chat_history.clear();
+            ctx->active_kv_tokens.clear();
             ctx->set_error("llama_state_set_data failed to restore context state.");
             return false;
         }
@@ -2728,18 +1929,10 @@ bool infer_state_load(infer_ctx* ctx, const char* filepath) {
         if (ctx->sampler) {
             llama_sampler_reset(ctx->sampler);
         }
-
-        const llama_pos pmax = llama_memory_seq_pos_max(llama_get_memory(ctx->lctx), 0);
-        const int restored_n_past = (pmax >= 0) ? static_cast<int>(pmax) + 1 : 0;
-
-        if (restored_kv.size() != static_cast<size_t>(restored_n_past)) {
-            invalidate_kv(ctx);
-            ctx->chat_history.clear();
-            ctx->set_error("State file active_kv_tokens count does not match restored KV cache positions.");
-            return false;
+        {
+            const llama_pos pmax = llama_memory_seq_pos_max(llama_get_memory(ctx->lctx), 0);
+            ctx->n_past.store(pmax >= 0 ? static_cast<int>(pmax) + 1 : 0, std::memory_order_relaxed);
         }
-
-        ctx->n_past.store(restored_n_past, std::memory_order_relaxed);
         ctx->n_keep = 0;
         ctx->chat_history = std::move(restored_history);
         ctx->active_kv_tokens = std::move(restored_kv);
@@ -2763,18 +1956,10 @@ int32_t infer_get_embedding_dim(infer_ctx* ctx) {
     }
 }
 
-bool infer_get_embeddings_ex(infer_ctx* ctx, const char* text, float* out_vec, size_t vec_len, bool normalize) {
-    if (!ctx) return false;
-    if (!text || !out_vec) {
-        ctx->set_error("Text and output buffer cannot be null.");
-        ctx->last_success.store(false, std::memory_order_release);
-        return false;
-    }
-
+bool infer_get_embeddings(infer_ctx* ctx, const char* text, float* out_vec, size_t vec_len) {
+    if (!ctx || !text || !out_vec) return false;
     size_t text_len = std::strlen(text);
-    if (text_len > static_cast<size_t>(INT32_MAX)) {
-        ctx->set_error("Input text length exceeds maximum limit.");
-        ctx->last_success.store(false, std::memory_order_release);
+    if (text_len >= static_cast<size_t>(INT32_MAX)) {
         return false;
     }
 
@@ -2784,8 +1969,7 @@ bool infer_get_embeddings_ex(infer_ctx* ctx, const char* text, float* out_vec, s
         return false;
     }
 
-    ctx->clear_error();
-    ctx->last_success.store(false, std::memory_order_release);
+    ctx->abort_flag.store(false, std::memory_order_release);
 
     try {
         std::lock_guard<std::mutex> lock(ctx->ctx_mutex);
@@ -2795,41 +1979,44 @@ bool infer_get_embeddings_ex(infer_ctx* ctx, const char* text, float* out_vec, s
         }
 
         const struct llama_vocab* vocab = llama_model_get_vocab(ctx->model);
-        if (!vocab) {
-            ctx->set_error("Model has no vocabulary.");
-            return false;
-        }
+        if (!vocab) { ctx->set_error("Model has no vocabulary."); return false; }
 
         int n_embd = llama_model_n_embd(ctx->model);
-        if (n_embd <= 0 || vec_len < static_cast<size_t>(n_embd)) {
+        if (vec_len < static_cast<size_t>(n_embd)) {
             ctx->set_error("Output buffer smaller than model embedding dimensions.");
             return false;
         }
 
         bool add_bos = want_bos(vocab, text);
-        std::vector<llama_token> tokens;
-        if (!tokenize_checked(vocab, text, text_len, add_bos, false, &tokens) || tokens.empty()) {
-            ctx->set_error("Embedding tokenization failed or text is empty.");
+        int n_tokens = -llama_tokenize(vocab, text, static_cast<int32_t>(text_len), nullptr, 0, add_bos, false);
+        if (n_tokens <= 0) { ctx->set_error("Embedding tokenization failed or text is empty."); return false; }
+
+        std::vector<llama_token> tokens(n_tokens);
+        int real_tokens = llama_tokenize(vocab, text, static_cast<int32_t>(text_len), tokens.data(), tokens.size(), add_bos, false);
+        if (real_tokens < 0) { ctx->set_error("Embedding tokenization failed."); return false; }
+        tokens.resize(real_tokens);
+
+        const uint64_t chat_used = static_cast<uint64_t>(std::max(0, ctx->n_past.load(std::memory_order_relaxed)));
+        if (static_cast<uint64_t>(tokens.size()) + chat_used > ctx->n_ctx) {
+            ctx->set_error("Input text exceeds free context capacity for embedding generation "
+                           "(chat KV shares the pool; call infer_memory_clear to free it).");
             return false;
         }
 
-        invalidate_kv(ctx);
-
         const int effective_batch_cap = std::min<int>(DEFAULT_BATCH_CAP, static_cast<int>(llama_n_batch(ctx->lctx)));
-        if (tokens.size() > static_cast<size_t>(effective_batch_cap) &&
-            llama_pooling_type(ctx->lctx) != LLAMA_POOLING_TYPE_NONE) {
+        if (tokens.size() > static_cast<size_t>(effective_batch_cap) && llama_pooling_type(ctx->lctx) != LLAMA_POOLING_TYPE_NONE) {
             ctx->set_error("Input exceeds batch size; pooled embeddings cannot be chunked.");
             return false;
         }
 
         llama_set_embeddings(ctx->lctx, true);
         struct EmbeddingModeGuard {
-            infer_ctx* c;
+            struct llama_context* l;
             ~EmbeddingModeGuard() {
-                llama_set_embeddings(c->lctx, false);
-                invalidate_kv(c);
+                llama_set_embeddings(l, false);
+                safe_kv_seq_rm(l, 1, -1, -1);
             }
-        } embd_guard{ctx};
+        } embd_guard{ctx->lctx};
 
         struct llama_batch batch = llama_batch_init(effective_batch_cap, 0, 1);
         struct BatchGuard {
@@ -2837,7 +2024,7 @@ bool infer_get_embeddings_ex(infer_ctx* ctx, const char* text, float* out_vec, s
             ~BatchGuard() { llama_batch_free(b); }
         } guard{batch};
 
-        for (size_t i = 0; i < tokens.size(); ) {
+        for (size_t i = 0; i < tokens.size(); i += batch.n_tokens) {
             if (ctx->abort_flag.load(std::memory_order_relaxed)) {
                 ctx->set_error("Embedding generation aborted.");
                 return false;
@@ -2847,11 +2034,11 @@ bool infer_get_embeddings_ex(infer_ctx* ctx, const char* text, float* out_vec, s
             int chunk = std::min<int>(effective_batch_cap, static_cast<int>(tokens.size() - i));
 
             for (int j = 0; j < chunk; ++j) {
-                size_t idx = i + static_cast<size_t>(j);
+                size_t idx = i + j;
                 batch.token[j]     = tokens[idx];
                 batch.pos[j]       = static_cast<llama_pos>(idx);
                 batch.n_seq_id[j]  = 1;
-                batch.seq_id[j][0] = 0;
+                batch.seq_id[j][0] = 1;
                 batch.logits[j]    = (idx == tokens.size() - 1);
                 batch.n_tokens++;
             }
@@ -2860,11 +2047,9 @@ bool infer_get_embeddings_ex(infer_ctx* ctx, const char* text, float* out_vec, s
                 ctx->set_error("Failed to decode prompt for embedding generation.");
                 return false;
             }
-
-            i += static_cast<size_t>(chunk);
         }
 
-        const float* embd = llama_get_embeddings_seq(ctx->lctx, 0);
+        const float* embd = llama_get_embeddings_seq(ctx->lctx, 1);
         if (!embd) embd = llama_get_embeddings_ith(ctx->lctx, -1);
         if (!embd) embd = llama_get_embeddings(ctx->lctx);
 
@@ -2873,22 +2058,7 @@ bool infer_get_embeddings_ex(infer_ctx* ctx, const char* text, float* out_vec, s
             return false;
         }
 
-        std::memcpy(out_vec, embd, static_cast<size_t>(n_embd) * sizeof(float));
-
-        if (normalize) {
-            double sum_sq = 0.0;
-            for (int i = 0; i < n_embd; ++i) {
-                sum_sq += static_cast<double>(out_vec[i]) * static_cast<double>(out_vec[i]);
-            }
-            if (sum_sq > 0.0) {
-                const float inv_norm = static_cast<float>(1.0 / std::sqrt(sum_sq));
-                for (int i = 0; i < n_embd; ++i) {
-                    out_vec[i] *= inv_norm;
-                }
-            }
-        }
-
-        ctx->last_success.store(true, std::memory_order_release);
+        std::memcpy(out_vec, embd, n_embd * sizeof(float));
         return true;
     } catch (const std::exception& e) {
         ctx->set_error(e.what());
@@ -2897,10 +2067,6 @@ bool infer_get_embeddings_ex(infer_ctx* ctx, const char* text, float* out_vec, s
         ctx->set_error("Unknown exception during infer_get_embeddings.");
         return false;
     }
-}
-
-bool infer_get_embeddings(infer_ctx* ctx, const char* text, float* out_vec, size_t vec_len) {
-    return infer_get_embeddings_ex(ctx, text, out_vec, vec_len, false);
 }
 
 void infer_abort(infer_ctx* ctx) {
@@ -2915,36 +2081,35 @@ bool infer_is_generating(infer_ctx* ctx) {
 
 void infer_wait(infer_ctx* ctx) {
     if (!ctx) return;
-    if (std::this_thread::get_id() == ctx->active_gen_thread_id.load(std::memory_order_acquire)) {
-        ctx->set_error("Cannot call infer_wait from inside an active generation callback.");
-        return;
-    }
-
-    try {
-        std::unique_lock<std::mutex> lk(ctx->gen_mutex);
-        ctx->cv_generating.wait(lk, [ctx]() {
-            return !ctx->is_generating.load(std::memory_order_acquire);
-        });
-    } catch (...) {}
-
     try {
         std::lock_guard<std::mutex> lock(ctx->worker_mutex);
         if (ctx->async_worker.joinable()) {
             ctx->async_worker.join();
         }
-    } catch (...) {}
+    } catch (...) {
+    }
 }
 
-bool infer_generate_chat_v2(
+bool infer_generate_chat(
     infer_ctx* ctx,
     const infer_chat_msg* msgs,
     size_t num_msgs,
     int32_t max_tokens,
-    infer_stream_cb_v2 callback,
+    infer_stream_cb callback,
     void* user_data
 ) {
     if (!ctx || !msgs || num_msgs == 0 || !callback) return false;
-    if (!validate_chat_messages(ctx, msgs, num_msgs)) return false;
+
+    for (size_t i = 0; i < num_msgs; ++i) {
+        if (!msgs[i].role || !msgs[i].content) {
+            ctx->set_error("Message role or content cannot be null.");
+            return false;
+        }
+        if (!is_valid_role(msgs[i].role)) {
+            ctx->set_error("Invalid message role (allowed: system, user, assistant, tool, developer).");
+            return false;
+        }
+    }
 
     GenAcquireGuard gen_guard(ctx);
     if (!gen_guard.acquired) {
@@ -2962,6 +2127,8 @@ bool infer_generate_chat_v2(
     ctx->clear_error();
 
     try {
+        ctx->chat_history.clear();
+        ctx->active_kv_tokens.clear();
         bool res = infer_generate_chat_internal(ctx, msgs, num_msgs, max_tokens, callback, user_data);
         ctx->last_success.store(res, std::memory_order_release);
         return res;
@@ -2976,7 +2143,7 @@ bool infer_generate_chat_v2(
     }
 }
 
-bool infer_generate_chat(
+bool infer_generate_chat_async(
     infer_ctx* ctx,
     const infer_chat_msg* msgs,
     size_t num_msgs,
@@ -2984,21 +2151,18 @@ bool infer_generate_chat(
     infer_stream_cb callback,
     void* user_data
 ) {
-    if (!callback) return false;
-    V1StreamThunk thunk{callback, user_data};
-    return infer_generate_chat_v2(ctx, msgs, num_msgs, max_tokens, v1_stream_adapter, &thunk);
-}
-
-bool infer_generate_chat_async_v2(
-    infer_ctx* ctx,
-    const infer_chat_msg* msgs,
-    size_t num_msgs,
-    int32_t max_tokens,
-    infer_stream_cb_v2 callback,
-    void* user_data
-) {
     if (!ctx || !msgs || num_msgs == 0 || !callback) return false;
-    if (!validate_chat_messages(ctx, msgs, num_msgs)) return false;
+
+    for (size_t i = 0; i < num_msgs; ++i) {
+        if (!msgs[i].role || !msgs[i].content) {
+            ctx->set_error("Message role or content cannot be null.");
+            return false;
+        }
+        if (!is_valid_role(msgs[i].role)) {
+            ctx->set_error("Invalid message role (allowed: system, user, assistant, tool, developer).");
+            return false;
+        }
+    }
 
     bool expected = false;
     if (!ctx->is_generating.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
@@ -3032,7 +2196,6 @@ bool infer_generate_chat_async_v2(
 
         try {
             ctx->async_worker = std::thread([ctx, owned_msgs = std::move(owned), max_tokens, callback, user_data]() {
-                ctx->active_gen_thread_id.store(std::this_thread::get_id(), std::memory_order_release);
                 struct WorkerFlagGuard {
                     infer_ctx* c;
                     ~WorkerFlagGuard() { release_gen(c); }
@@ -3045,6 +2208,8 @@ bool infer_generate_chat_async_v2(
                 }
 
                 try {
+                    ctx->chat_history.clear();
+                    ctx->active_kv_tokens.clear();
                     bool res = infer_generate_chat_internal(ctx, view.data(), view.size(), max_tokens, callback, user_data);
                     ctx->last_success.store(res, std::memory_order_release);
                 } catch (const std::exception& e) {
@@ -3072,96 +2237,12 @@ bool infer_generate_chat_async_v2(
     }
 }
 
-bool infer_generate_chat_async(
-    infer_ctx* ctx,
-    const infer_chat_msg* msgs,
-    size_t num_msgs,
-    int32_t max_tokens,
-    infer_stream_cb callback,
-    void* user_data
-) {
-    if (!ctx || !msgs || num_msgs == 0 || !callback) return false;
-    if (!validate_chat_messages(ctx, msgs, num_msgs)) return false;
-
-    bool expected = false;
-    if (!ctx->is_generating.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        ctx->set_error("Inference context is currently busy.");
-        return false;
-    }
-
-    if (!ctx->model || !ctx->lctx || !ctx->sampler) {
-        ctx->set_error("Model and context are not initialized.");
-        release_gen(ctx);
-        return false;
-    }
-
-    try {
-        std::vector<OwnedMsg> owned;
-        owned.reserve(num_msgs);
-        for (size_t i = 0; i < num_msgs; ++i) {
-            owned.push_back({ msgs[i].role, msgs[i].content });
-        }
-
-        std::lock_guard<std::mutex> wlock(ctx->worker_mutex);
-
-        if (ctx->async_worker.joinable()) {
-            ctx->async_worker.join();
-        }
-
-        ctx->abort_flag.store(false, std::memory_order_release);
-        ctx->clear_error();
-        const bool prev_success = ctx->last_success.load(std::memory_order_acquire);
-        ctx->last_success.store(false, std::memory_order_release);
-
-        try {
-            ctx->async_worker = std::thread([ctx, owned_msgs = std::move(owned), max_tokens, callback, user_data]() {
-                ctx->active_gen_thread_id.store(std::this_thread::get_id(), std::memory_order_release);
-                struct WorkerFlagGuard {
-                    infer_ctx* c;
-                    ~WorkerFlagGuard() { release_gen(c); }
-                } flag_guard{ctx};
-
-                std::vector<infer_chat_msg> view(owned_msgs.size());
-                for (size_t i = 0; i < owned_msgs.size(); ++i) {
-                    view[i].role    = owned_msgs[i].role.c_str();
-                    view[i].content = owned_msgs[i].content.c_str();
-                }
-
-                V1StreamThunk thunk{callback, user_data};
-                try {
-                    bool res = infer_generate_chat_internal(ctx, view.data(), view.size(), max_tokens, v1_stream_adapter, &thunk);
-                    ctx->last_success.store(res, std::memory_order_release);
-                } catch (const std::exception& e) {
-                    ctx->last_success.store(false, std::memory_order_release);
-                    ctx->set_error(e.what());
-                } catch (...) {
-                    ctx->last_success.store(false, std::memory_order_release);
-                    ctx->set_error("Unknown exception during async chat generation.");
-                }
-            });
-        } catch (...) {
-            ctx->last_success.store(prev_success, std::memory_order_release);
-            throw;
-        }
-
-        return true;
-    } catch (const std::exception& e) {
-        ctx->set_error(e.what());
-        release_gen(ctx);
-        return false;
-    } catch (...) {
-        ctx->set_error("Unknown exception launching async thread.");
-        release_gen(ctx);
-        return false;
-    }
-}
-
-bool infer_generate_chat_turn_v2(
+bool infer_generate_chat_turn(
     infer_ctx* ctx,
     const char* role,
     const char* content,
     int32_t max_tokens,
-    infer_stream_cb_v2 callback,
+    infer_stream_cb callback,
     void* user_data
 ) {
     if (!ctx || !role || !content || !callback) return false;
@@ -3189,53 +2270,25 @@ bool infer_generate_chat_turn_v2(
         std::vector<OwnedMsg>& hist_ref;
         std::vector<OwnedMsg> backup;
         bool armed = true;
-
+        
         explicit HistoryGuard(std::vector<OwnedMsg>& h) : hist_ref(h), backup(h) {}
         ~HistoryGuard() {
             if (armed) {
-                hist_ref = std::move(backup);
+                hist_ref = std::move(backup); // Restore full history state on failure
             }
         }
     } hist_guard{ ctx->chat_history };
 
     try {
         const struct llama_vocab* vocab = llama_model_get_vocab(ctx->model);
-        std::string safe_content = neutralize_special_fast(content, ctx->special_lookup);
-        ctx->chat_history.push_back({ role, std::move(safe_content) });
-
-        const uint32_t safety_margin = 128;
-        if (ctx->n_ctx <= safety_margin) {
-            ctx->set_error("Context size too small for chat turn safety margin.");
+        const char* chat_template = llama_model_chat_template(ctx->model, nullptr);
+        if (!chat_template) {
+            ctx->set_error("Model specifies no chat template.");
             return false;
         }
-        const uint32_t max_prompt_budget = ctx->n_ctx - safety_margin;
 
-        auto estimate_msg_tokens = [vocab](const OwnedMsg& m) -> uint32_t {
-            int32_t cnt = 0;
-            if (tokenize_checked(vocab, m.content.c_str(), m.content.size(), false, true, nullptr, &cnt) && cnt > 0) {
-                return static_cast<uint32_t>(cnt) + 8u;
-            }
-            return static_cast<uint32_t>(m.content.size() / 3) + 8u;
-        };
-
-        auto find_prune_start = [&]() -> size_t {
-            size_t idx = 0;
-            while (idx + 1 < ctx->chat_history.size() &&
-                   (ctx->chat_history[idx].role == "system" || ctx->chat_history[idx].role == "developer")) {
-                idx++;
-            }
-            return idx;
-        };
-
-        auto find_next_turn_boundary = [&](size_t start_idx) -> size_t {
-            const size_t limit = ctx->chat_history.size() - 1;
-            if (start_idx >= limit) return start_idx;
-            size_t end_idx = start_idx + 1;
-            while (end_idx < limit && ctx->chat_history[end_idx].role != "user") {
-                end_idx++;
-            }
-            return end_idx;
-        };
+        std::string safe_content = neutralize_special_fast(content, ctx->special_lookup);
+        ctx->chat_history.push_back({ role, safe_content });
 
         while (true) {
             std::vector<struct llama_chat_message> llama_msgs;
@@ -3244,63 +2297,50 @@ bool infer_generate_chat_turn_v2(
                 llama_msgs.push_back({ m.role.c_str(), m.content.c_str() });
             }
 
-            std::string formatted;
-            if (!render_chat_template_with_fallback(ctx, llama_msgs, formatted)) {
+            int alloc_size = llama_chat_apply_template(chat_template, llama_msgs.data(), llama_msgs.size(), true, nullptr, 0);
+            if (alloc_size <= 0) {
+                ctx->set_error("Chat template formatting failed.");
                 return false;
             }
 
-            bool add_bos = want_bos(vocab, formatted.c_str());
-            int32_t n_tokens = 0;
-            if (!tokenize_checked(vocab, formatted.c_str(), formatted.size(), add_bos, true, nullptr, &n_tokens) ||
-                n_tokens <= 0) {
+            std::vector<char> formatted(alloc_size + 1, '\0');
+            int written = llama_chat_apply_template(chat_template, llama_msgs.data(), llama_msgs.size(), true, formatted.data(), formatted.size());
+            if (written < 0) {
+                ctx->set_error("Chat template failed to render prompt.");
+                return false;
+            }
+
+            bool add_bos = want_bos(vocab, formatted.data());
+            int n_tokens = -llama_tokenize(vocab, formatted.data(), written, nullptr, 0, add_bos, true);
+            if (n_tokens <= 0) {
                 ctx->set_error("Tokenization calculation failed.");
                 return false;
             }
 
-            if (static_cast<uint32_t>(n_tokens) <= max_prompt_budget) {
-                std::vector<llama_token> prompt_tokens;
-                if (!tokenize_checked(vocab, formatted.c_str(), formatted.size(), add_bos, true, &prompt_tokens) ||
-                    prompt_tokens.empty()) {
+            const uint32_t safety_margin = 128;
+            if (static_cast<uint32_t>(n_tokens) + safety_margin <= ctx->n_ctx) {
+                std::vector<llama_token> prompt_tokens(n_tokens);
+                int real_tokens = llama_tokenize(vocab, formatted.data(), written, prompt_tokens.data(), prompt_tokens.size(), add_bos, true);
+                if (real_tokens < 0) {
                     ctx->set_error("Failed to tokenize chat turn.");
                     return false;
                 }
+                prompt_tokens.resize(real_tokens);
 
-                const int prev_past = ctx->n_past.load(std::memory_order_relaxed);
                 std::string generated_response;
                 bool res = execute_decode(ctx, prompt_tokens, true, max_tokens, callback, user_data, &generated_response);
-
-                if (res || ctx->n_past.load(std::memory_order_relaxed) > prev_past) {
-                    hist_guard.armed = false;
-                }
-                if (res) {
+                if (res && !generated_response.empty()) {
                     std::string safe_response = neutralize_special_fast(generated_response.c_str(), ctx->special_lookup);
                     ctx->chat_history.push_back({ "assistant", std::move(safe_response) });
+                    hist_guard.armed = false;
                 }
                 ctx->last_success.store(res, std::memory_order_release);
                 return res;
             }
 
-            const uint32_t excess_tokens = static_cast<uint32_t>(n_tokens) - max_prompt_budget;
-            const size_t prune_start = find_prune_start();
-            size_t prune_end = prune_start;
-            uint32_t freed_estimate = 0;
-
-            while (freed_estimate < excess_tokens) {
-                size_t next_boundary = find_next_turn_boundary(prune_end);
-                if (next_boundary == prune_end) {
-                    break;
-                }
-                for (size_t i = prune_end; i < next_boundary; ++i) {
-                    freed_estimate += estimate_msg_tokens(ctx->chat_history[i]);
-                }
-                prune_end = next_boundary;
-            }
-
-            if (prune_end > prune_start) {
-                ctx->chat_history.erase(
-                    ctx->chat_history.begin() + static_cast<std::ptrdiff_t>(prune_start),
-                    ctx->chat_history.begin() + static_cast<std::ptrdiff_t>(prune_end)
-                );
+            size_t prune_idx = (ctx->chat_history.size() > 1 && ctx->chat_history[0].role == "system") ? 1 : 0;
+            if (ctx->chat_history.size() > prune_idx + 2) {
+                ctx->chat_history.erase(ctx->chat_history.begin() + prune_idx, ctx->chat_history.begin() + prune_idx + 2);
             } else {
                 ctx->set_error("Single chat turn exceeds context capacity.");
                 return false;
@@ -3317,31 +2357,17 @@ bool infer_generate_chat_turn_v2(
     }
 }
 
-bool infer_generate_chat_turn(
-    infer_ctx* ctx,
-    const char* role,
-    const char* content,
-    int32_t max_tokens,
-    infer_stream_cb callback,
-    void* user_data
-) {
-    if (!callback) return false;
-    V1StreamThunk thunk{callback, user_data};
-    return infer_generate_chat_turn_v2(ctx, role, content, max_tokens, v1_stream_adapter, &thunk);
-}
-
-bool infer_generate_completion_v2(
+bool infer_generate_completion(
     infer_ctx* ctx,
     const char* raw_prompt,
     int32_t max_tokens,
-    infer_stream_cb_v2 callback,
+    infer_stream_cb callback,
     void* user_data
 ) {
     if (!ctx || !raw_prompt || !callback) return false;
 
     size_t prompt_len = std::strlen(raw_prompt);
-    if (prompt_len > static_cast<size_t>(INT32_MAX)) {
-        ctx->set_error("Raw prompt length exceeds maximum limit.");
+    if (prompt_len >= static_cast<size_t>(INT32_MAX)) {
         return false;
     }
 
@@ -3365,13 +2391,22 @@ bool infer_generate_completion_v2(
         ctx->active_kv_tokens.clear();
 
         const struct llama_vocab* vocab = llama_model_get_vocab(ctx->model);
+        int written = static_cast<int>(prompt_len);
+
         bool add_bos = want_bos(vocab, raw_prompt);
-        std::vector<llama_token> prompt_tokens;
-        if (!tokenize_checked(vocab, raw_prompt, prompt_len, add_bos, false, &prompt_tokens) ||
-            prompt_tokens.empty()) {
+        int n_tokens = -llama_tokenize(vocab, raw_prompt, written, nullptr, 0, add_bos, false);
+        if (n_tokens <= 0) {
+            ctx->set_error("Tokenization calculation failed.");
+            return false;
+        }
+
+        std::vector<llama_token> prompt_tokens(n_tokens);
+        int real_tokens = llama_tokenize(vocab, raw_prompt, written, prompt_tokens.data(), prompt_tokens.size(), add_bos, false);
+        if (real_tokens < 0) {
             ctx->set_error("Prompt tokenization failed.");
             return false;
         }
+        prompt_tokens.resize(real_tokens);
 
         bool res = execute_decode(ctx, prompt_tokens, false, max_tokens, callback, user_data);
         ctx->last_success.store(res, std::memory_order_release);
@@ -3387,29 +2422,12 @@ bool infer_generate_completion_v2(
     }
 }
 
-bool infer_generate_completion(
-    infer_ctx* ctx,
-    const char* raw_prompt,
-    int32_t max_tokens,
-    infer_stream_cb callback,
-    void* user_data
-) {
-    if (!callback) return false;
-    V1StreamThunk thunk{callback, user_data};
-    return infer_generate_completion_v2(ctx, raw_prompt, max_tokens, v1_stream_adapter, &thunk);
-}
-
 void infer_free(infer_ctx* ctx) {
     if (!ctx) return;
 
-    ctx->abort_flag.store(true, std::memory_order_release);
+   ctx->abort_flag.store(true, std::memory_order_release);
 
-    if (std::this_thread::get_id() == ctx->active_gen_thread_id.load(std::memory_order_acquire)) {
-        ctx->set_error("Cannot call infer_free from inside an active generation callback.");
-        return;
-    }
-
-    try {
+     try {
         std::unique_lock<std::mutex> lk(ctx->gen_mutex);
         ctx->cv_generating.wait(lk, [ctx]() {
             return !ctx->is_generating.load(std::memory_order_acquire);
@@ -3425,7 +2443,19 @@ void infer_free(infer_ctx* ctx) {
 
     try {
         std::lock_guard<std::mutex> lock(ctx->ctx_mutex);
-        free_model_resources_locked(ctx);
+        if (ctx->sampler) {
+            llama_sampler_free(ctx->sampler);
+            ctx->sampler      = nullptr;
+            ctx->penalty_smpl = nullptr;
+        }
+        if (ctx->lctx) {
+            llama_free(ctx->lctx);
+            ctx->lctx = nullptr;
+        }
+        if (ctx->model) {
+            llama_model_free(ctx->model);
+            ctx->model = nullptr;
+        }
     } catch (...) {}
 
     delete ctx;
