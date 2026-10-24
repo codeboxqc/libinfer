@@ -1282,8 +1282,7 @@ uint32_t calculate_safe_n_ctx(
     const uint32_t safe_tokens = (max_tokens_64 > UINT32_MAX) ? UINT32_MAX : static_cast<uint32_t>(max_tokens_64);
 
     return std::max<uint32_t>(floor_ctx, std::min<uint32_t>(target_ctx, safe_tokens));
-	 
-	 
+}
 
 template <typename T, typename = void>
 struct has_flash_attn_bool : std::false_type {};
