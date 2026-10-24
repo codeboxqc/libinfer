@@ -23,7 +23,6 @@
 #include <string_view>
 #include <thread>
 #include <type_traits>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -52,7 +51,7 @@ constexpr uint32_t DEFAULT_FALLBACK_CTX = 4096;
 constexpr uint64_t MAX_STATE_FILE_SIZE  = 64ULL * 1024ULL * 1024ULL * 1024ULL; // 64 GiB bound
 
 std::mutex g_backend_mutex;
-int32_t    g_backend_ref_count = 0;
+int32_t    g_backend_ref_count  = 0;
 int32_t    g_cached_env_threads = 0;
 uint32_t   g_cached_phys_cores  = 0;
 
@@ -180,36 +179,54 @@ bool get_module_dir_utf8(std::string& out) {
 #endif
 }
 
- 
-
-
- namespace {
-
-void add_to_dll_path(const std::string& path) {
+bool directory_exists_utf8(const std::string& path) {
 #if defined(_WIN32)
-    // 1. Add directory to process PATH environment variable (for cuBLAS/Vulkan delayed DLL loading)
-    char orig_path[32768] = {};
-    DWORD len = GetEnvironmentVariableA("PATH", orig_path, sizeof(orig_path));
-    if (len > 0 && len < sizeof(orig_path)) {
-        std::string new_path = path + ";" + std::string(orig_path);
-        SetEnvironmentVariableA("PATH", new_path.c_str());
-    } else {
-        SetEnvironmentVariableA("PATH", path.c_str());
-    }
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    if (wlen <= 0) return false;
+    std::vector<wchar_t> wbuf(static_cast<size_t>(wlen));
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wbuf.data(), wlen);
+    DWORD attr = GetFileAttributesW(wbuf.data());
+    return (attr != INVALID_FILE_ATTRIBUTES) && ((attr & FILE_ATTRIBUTE_DIRECTORY) != 0);
+#else
+    struct stat st{};
+    return (::stat(path.c_str(), &st) == 0) && S_ISDIR(st.st_mode);
+#endif
+}
 
-    // 2. Add directory to process DLL search path
+void add_to_dll_path(const std::string& path, bool set_primary_dll_dir) {
+#if defined(_WIN32)
     int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
     if (wlen > 0) {
         std::vector<wchar_t> wbuf(static_cast<size_t>(wlen));
         MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wbuf.data(), wlen);
-        SetDllDirectoryW(wbuf.data());
+
+        // 1. Prepend directory to process PATH environment variable (UTF-16 safe)
+        DWORD req = GetEnvironmentVariableW(L"PATH", nullptr, 0);
+        std::wstring new_path(wbuf.data(), static_cast<size_t>(wlen - 1));
+        if (req > 0) {
+            std::vector<wchar_t> orig_path(static_cast<size_t>(req));
+            DWORD got = GetEnvironmentVariableW(L"PATH", orig_path.data(), req);
+            if (got > 0 && got < req) {
+                new_path.push_back(L';');
+                new_path.append(orig_path.data(), static_cast<size_t>(got));
+            }
+        }
+        SetEnvironmentVariableW(L"PATH", new_path.c_str());
+
+        // 2. SetDllDirectoryW replaces the previous value on each call, so only set it
+        //    when requested for the primary directory.
+        if (set_primary_dll_dir) {
+            SetDllDirectoryW(wbuf.data());
+        }
     }
+#else
+    (void)set_primary_dll_dir;
 #endif
 
     ggml_backend_load_all_from_path(path.c_str());
 }
 
- bool ref_llama_backend(std::string& err_out) {
+bool ref_llama_backend(std::string& err_out) {
     std::lock_guard<std::mutex> lock(g_backend_mutex);
     if (g_backend_ref_count == 0) {
         const char* single_inst = std::getenv("INFER_SINGLE_INSTANCE");
@@ -279,10 +296,10 @@ void add_to_dll_path(const std::string& path) {
             return false;
         }
 
-        // 1. Scan root executable directory
-        add_to_dll_path(dir);
+        // 1. Scan root executable/module directory
+        add_to_dll_path(dir, true);
 
-        // 2. Scan subdirectories (cuda/, vulkan/)
+        // 2. Scan existing subdirectories (cuda/, vulkan/)
         static const char* const subdirs[] = {
             "/cuda",
             "/vulkan"
@@ -290,7 +307,9 @@ void add_to_dll_path(const std::string& path) {
 
         for (const char* sub : subdirs) {
             std::string subpath = dir + sub;
-            add_to_dll_path(subpath);
+            if (directory_exists_utf8(subpath)) {
+                add_to_dll_path(subpath, false);
+            }
         }
 
         llama_backend_init();
@@ -298,10 +317,6 @@ void add_to_dll_path(const std::string& path) {
     g_backend_ref_count++;
     return true;
 }
-
-} // anonymous namespace
-
-
 
 void unref_llama_backend() {
     std::lock_guard<std::mutex> lock(g_backend_mutex);
@@ -519,7 +534,7 @@ uint32_t update_crc32(uint32_t crc_in, const void* buf, size_t len) {
     return ~crc;
 }
 
-size_t find_valid_utf8_end(const std::string& s) {
+size_t find_valid_utf8_end(std::string_view s) {
     if (s.empty()) return 0;
     for (size_t back = 1; back <= std::min<size_t>(4, s.size()); ++back) {
         uint8_t b = static_cast<uint8_t>(s[s.size() - back]);
@@ -561,31 +576,56 @@ bool tokenize_checked(
         return false;
     }
     const int32_t len_i32 = static_cast<int32_t>(text_len);
-    const int32_t n = llama_tokenize(vocab, text, len_i32, nullptr, 0, add_special, parse_special);
-    if (n == INT32_MIN) {
-        return false;
-    }
-    int32_t needed = (n < 0) ? -n : n;
-    if (needed <= 0) {
-        if (out_count) *out_count = 0;
-        if (out_tokens) out_tokens->clear();
-        return (text_len == 0);
-    }
+
     if (!out_tokens) {
+        const int32_t n = llama_tokenize(vocab, text, len_i32, nullptr, 0, add_special, parse_special);
+        if (n == INT32_MIN) {
+            return false;
+        }
+        const int32_t needed = (n < 0) ? -n : n;
+        if (needed <= 0) {
+            if (out_count) *out_count = 0;
+            return (text_len == 0);
+        }
         if (out_count) *out_count = needed;
         return true;
     }
-    out_tokens->resize(static_cast<size_t>(needed));
+
+    // Single-pass fast path: pre-allocate estimated token capacity to avoid tokenizing twice
+    const size_t est_cap = std::min<size_t>(
+        std::max<size_t>(32, (text_len / 2) + 16),
+        static_cast<size_t>(INT32_MAX)
+    );
+    out_tokens->resize(est_cap);
+
     int32_t actual = llama_tokenize(
         vocab, text, len_i32, out_tokens->data(), static_cast<int32_t>(out_tokens->size()), add_special, parse_special);
     if (actual < 0) {
-        if (actual == INT32_MIN) return false;
-        needed = -actual;
+        if (actual == INT32_MIN) {
+            out_tokens->clear();
+            return false;
+        }
+        const int32_t needed = -actual;
+        if (needed <= 0) {
+            out_tokens->clear();
+            if (out_count) *out_count = 0;
+            return (text_len == 0);
+        }
         out_tokens->resize(static_cast<size_t>(needed));
         actual = llama_tokenize(
             vocab, text, len_i32, out_tokens->data(), static_cast<int32_t>(out_tokens->size()), add_special, parse_special);
-        if (actual < 0) return false;
+        if (actual < 0) {
+            out_tokens->clear();
+            return false;
+        }
     }
+
+    if (actual == 0 && text_len > 0) {
+        out_tokens->clear();
+        if (out_count) *out_count = 0;
+        return false;
+    }
+
     out_tokens->resize(static_cast<size_t>(actual));
     if (out_count) *out_count = actual;
     return true;
@@ -627,7 +667,7 @@ std::vector<std::string> collect_special_texts(const struct llama_vocab* v) {
         const bool pipe_marker = angle && len >= 5 && t[1] == '|' && t[len - 2] == '|';
 
         const bool user_marker = pipe_marker || (angle && !is_plain_html_tag(t, len));
-        if (is_control ? (angle || square) : user_marker) out.emplace_back(t);
+        if (is_control ? (angle || square) : user_marker) out.emplace_back(t, len);
     }
     std::sort(out.begin(), out.end());
     out.erase(std::unique(out.begin(), out.end()), out.end());
@@ -635,23 +675,40 @@ std::vector<std::string> collect_special_texts(const struct llama_vocab* v) {
 }
 
 struct SpecialTokenLookup {
-    std::unordered_set<std::string> set;
+    std::vector<std::string> sorted_tokens;
     size_t min_len = SIZE_MAX;
     size_t max_len = 0;
 
     void build(const std::vector<std::string>& specials) {
-        set.clear();
+        sorted_tokens = specials;
+        std::sort(sorted_tokens.begin(), sorted_tokens.end());
+        sorted_tokens.erase(std::unique(sorted_tokens.begin(), sorted_tokens.end()), sorted_tokens.end());
         min_len = SIZE_MAX;
         max_len = 0;
-        for (const auto& sp : specials) {
-            set.insert(sp);
+        for (const auto& sp : sorted_tokens) {
             if (sp.size() < min_len) min_len = sp.size();
             if (sp.size() > max_len) max_len = sp.size();
         }
     }
 
-    void clear() {
-        set.clear();
+    bool contains(std::string_view probe) const noexcept {
+        auto it = std::lower_bound(
+            sorted_tokens.begin(),
+            sorted_tokens.end(),
+            probe,
+            [](const std::string& a, std::string_view b) noexcept {
+                return std::string_view(a) < b;
+            }
+        );
+        return it != sorted_tokens.end() && std::string_view(*it) == probe;
+    }
+
+    bool empty() const noexcept {
+        return sorted_tokens.empty();
+    }
+
+    void clear() noexcept {
+        sorted_tokens.clear();
         min_len = SIZE_MAX;
         max_len = 0;
     }
@@ -659,33 +716,38 @@ struct SpecialTokenLookup {
 
 std::string neutralize_special_fast(const char* in, const SpecialTokenLookup& lookup) {
     if (!in || !*in) return "";
-    if (lookup.set.empty()) return std::string(in);
-
-    static const char ZWSP[] = "\xE2\x80\x8B";
     const std::string_view s(in);
-    std::string out;
-    out.reserve(s.size());
+    if (lookup.empty()) return std::string(s);
 
-    std::string probe;
-    for (size_t i = 0; i < s.size(); ++i) {
-        const char c = s[i];
-        bool hit = false;
-        if (c == '<' || c == '[') {
-            const size_t rem = s.size() - i;
-            const size_t max_check = std::min(rem, lookup.max_len);
-            const char expected_close = (c == '<') ? '>' : ']';
-            for (size_t len = lookup.min_len; len <= max_check; ++len) {
-                if (s[i + len - 1] == expected_close) {
-                    probe.assign(s.data() + i, len);
-                    if (lookup.set.count(probe) > 0) {
-                        hit = true;
-                        break;
-                    }
+    size_t pos = s.find_first_of("<[");
+    if (pos == std::string_view::npos) {
+        return std::string(s);
+    }
+
+    static constexpr std::string_view ZWSP("\xE2\x80\x8B", 3);
+    std::string out;
+    out.reserve(s.size() + 16);
+
+    size_t last = 0;
+    while (pos != std::string_view::npos) {
+        out.append(s.data() + last, pos - last + 1);
+        const char c = s[pos];
+        const size_t rem = s.size() - pos;
+        const size_t max_check = std::min(rem, lookup.max_len);
+        const char expected_close = (c == '<') ? '>' : ']';
+        for (size_t len = lookup.min_len; len <= max_check; ++len) {
+            if (s[pos + len - 1] == expected_close) {
+                if (lookup.contains(s.substr(pos, len))) {
+                    out.append(ZWSP.data(), ZWSP.size());
+                    break;
                 }
             }
         }
-        out.push_back(c);
-        if (hit) out.append(ZWSP);
+        last = pos + 1;
+        pos = s.find_first_of("<[", last);
+    }
+    if (last < s.size()) {
+        out.append(s.data() + last, s.size() - last);
     }
     return out;
 }
@@ -759,8 +821,6 @@ uint64_t compute_model_fingerprint(struct llama_model* model) {
     return h;
 }
 
-bool v1_stream_adapter(const char* piece, size_t len, void* udata);
-
 struct V1StreamThunk {
     infer_stream_cb cb = nullptr;
     void* user_data    = nullptr;
@@ -781,6 +841,8 @@ public:
                 max_stop_len_ = w.size();
             }
         }
+        buffer_.reserve(256);
+        emit_buf_.reserve(256);
     }
 
     bool append_and_flush(const char* piece, size_t len) {
@@ -802,11 +864,10 @@ public:
             hit_stop_ = true;
             stop_abs_ = flushed_ + earliest_pos;
             if (earliest_pos > 0) {
-                std::string pre = buffer_.substr(0, earliest_pos);
-                size_t valid = find_valid_utf8_end(pre);
+                size_t valid = find_valid_utf8_end(std::string_view(buffer_.data(), earliest_pos));
                 if (valid > 0 && !user_aborted_) {
-                    pre.resize(valid);
-                    if (!callback_(pre.c_str(), valid, user_data_)) {
+                    emit_buf_.assign(buffer_.data(), valid);
+                    if (!callback_(emit_buf_.c_str(), valid, user_data_)) {
                         user_aborted_ = true;
                     }
                 }
@@ -826,14 +887,13 @@ public:
             candidate--;
         }
 
-        std::string candidate_slice = buffer_.substr(0, candidate);
-        size_t flushable = find_valid_utf8_end(candidate_slice);
+        size_t flushable = find_valid_utf8_end(std::string_view(buffer_.data(), candidate));
 
         if (flushable > 0) {
-            std::string to_emit = buffer_.substr(0, flushable);
+            emit_buf_.assign(buffer_.data(), flushable);
             buffer_.erase(0, flushable);
             flushed_ += flushable;
-            if (!callback_(to_emit.c_str(), flushable, user_data_)) {
+            if (!callback_(emit_buf_.c_str(), flushable, user_data_)) {
                 user_aborted_ = true;
                 return false;
             }
@@ -860,11 +920,10 @@ public:
             hit_stop_ = true;
             stop_abs_ = flushed_ + earliest_pos;
             if (earliest_pos > 0) {
-                std::string pre = buffer_.substr(0, earliest_pos);
-                size_t valid = find_valid_utf8_end(pre);
+                size_t valid = find_valid_utf8_end(std::string_view(buffer_.data(), earliest_pos));
                 if (valid > 0 && !user_aborted_) {
-                    pre.resize(valid);
-                    if (!callback_(pre.c_str(), valid, user_data_)) {
+                    emit_buf_.assign(buffer_.data(), valid);
+                    if (!callback_(emit_buf_.c_str(), valid, user_data_)) {
                         user_aborted_ = true;
                     }
                 }
@@ -874,10 +933,10 @@ public:
         }
 
         if (!buffer_.empty()) {
-            size_t valid = find_valid_utf8_end(buffer_);
+            size_t valid = find_valid_utf8_end(std::string_view(buffer_));
             if (valid > 0 && !user_aborted_) {
-                std::string emit = buffer_.substr(0, valid);
-                if (!callback_(emit.c_str(), valid, user_data_)) {
+                emit_buf_.assign(buffer_.data(), valid);
+                if (!callback_(emit_buf_.c_str(), valid, user_data_)) {
                     user_aborted_ = true;
                 }
             }
@@ -898,6 +957,7 @@ private:
     const std::vector<std::string>& stop_words_;
     size_t max_stop_len_ = 0;
     std::string buffer_;
+    std::string emit_buf_;
     size_t flushed_    = 0;
     size_t stop_abs_   = 0;
     bool hit_stop_     = false;
@@ -946,8 +1006,9 @@ struct infer_ctx {
     std::string              custom_chat_template;
     std::vector<std::string> stop_words;
     SpecialTokenLookup       special_lookup;
-    uint32_t                 n_ctx  = 0;
-    int                      n_keep = 0;
+    uint64_t                 model_fingerprint = 0;
+    uint32_t                 n_ctx             = 0;
+    int                      n_keep            = 0;
 
     std::atomic<int>             n_past{0};
     std::atomic<bool>            abort_flag{false};
@@ -1089,12 +1150,6 @@ int32_t read_model_meta_i32(struct llama_model* model, const std::string& key, i
     return fallback;
 }
 
- 
-
-
-// ============================================================================
-// Replace calculate_safe_n_ctx in infer_core.cpp (inside anonymous namespace)
-// ============================================================================
 uint32_t calculate_safe_n_ctx(
     struct llama_model* model,
     uint32_t requested_ctx,
@@ -1122,8 +1177,8 @@ uint32_t calculate_safe_n_ctx(
 
     // Auto-select target context from GPU VRAM + System RAM
     uint32_t auto_tier_ctx = DEFAULT_FALLBACK_CTX; // 4096 default (6 GB GPU)
-    if (total_vram == 0) {
-        // CPU-only mode: scale with System RAM (8192 if >= 16 GB free RAM, else 4096)
+    if (total_vram == 0 || n_gpu_layers == 0) {
+        // CPU-only mode: scale with System RAM (8192 if >= 12 GB free RAM, else 4096)
         auto_tier_ctx = (free_sys_ram >= (12000ULL * 1024ULL * 1024ULL)) ? 8192 : 4096;
     } else if (total_vram <= (4600ULL * 1024ULL * 1024ULL)) {
         auto_tier_ctx = 2048;  // <= 4 GB GPU
@@ -1162,46 +1217,73 @@ uint32_t calculate_safe_n_ctx(
     const size_t blck_v = std::max<size_t>(1, ggml_blck_size(type_v));
     const size_t row_bytes_k = (static_cast<size_t>(n_head_kv) * static_cast<size_t>(head_dim_k) * ggml_type_size(type_k)) / blck_k;
     const size_t row_bytes_v = (static_cast<size_t>(n_head_kv) * static_cast<size_t>(head_dim_v) * ggml_type_size(type_v)) / blck_v;
-    const size_t bytes_per_token = static_cast<size_t>(n_layer) * (row_bytes_k + row_bytes_v);
+    const size_t bytes_per_layer_token = row_bytes_k + row_bytes_v;
 
-    if (bytes_per_token == 0) {
+    if (bytes_per_layer_token == 0) {
         return target_ctx;
     }
 
-    // In Hybrid GPU+RAM mode (when n_gpu_layers < n_layer), KV layers on CPU use System RAM!
-    uint64_t usable_pool = (n_gpu_layers != 0) ? free_vram : free_sys_ram;
-    if (n_gpu_layers > 0 && n_gpu_layers < n_layer && free_sys_ram > usable_pool) {
-        // Hybrid offload: KV cache is split between VRAM and System RAM
-        usable_pool += (free_sys_ram / 4);
+    const int32_t gpu_layers = (total_vram > 0 && n_gpu_layers != 0)
+        ? ((n_gpu_layers < 0) ? n_layer : std::min<int32_t>(n_gpu_layers, n_layer))
+        : 0;
+    const int32_t cpu_layers = n_layer - gpu_layers;
+
+    if (gpu_layers == 0 && free_sys_ram == 0) {
+        return target_ctx;
     }
-    if (usable_pool == 0) {
-        usable_pool = free_sys_ram;
-    }
-    if (usable_pool == 0) {
+    if (gpu_layers > 0 && free_vram == 0 && free_sys_ram == 0) {
         return target_ctx;
     }
 
-    // Context is sized AFTER the weights are resident, but llama's compute buffers are only
-    // allocated later in llama_init_from_model(), and on Windows (WDDM / CUDA sysmem fallback)
-    // an over-full GPU does not fail: it silently spills to shared RAM and the UI freezes.
-    // So keep a real reserve: >= 1 GiB, or 1/8 of total VRAM on big cards.
-    const bool gpu_pool = (n_gpu_layers != 0) && total_vram > 0;
-    const uint64_t headroom = gpu_pool
+    // Reserve >= 1 GiB (or 1/8 of total VRAM on large GPUs) for compute buffers so Windows WDDM
+    // never spills GPU KV allocations into shared system memory.
+    const uint64_t gpu_headroom = (total_vram > 0)
         ? std::max<uint64_t>(1024ULL * 1024ULL * 1024ULL, total_vram / 8)
         : 1024ULL * 1024ULL * 1024ULL;
-    if (usable_pool <= headroom) {
-        return std::min<uint32_t>(target_ctx, 2048);
+    const uint64_t cpu_headroom = 1024ULL * 1024ULL * 1024ULL;
+
+     
+	 
+	 
+	 const uint32_t floor_ctx = std::min<uint32_t>(target_ctx, 1024u);
+
+    uint64_t max_tokens_gpu = UINT64_MAX;
+    if (gpu_layers > 0 && free_vram > 0) {
+        if (free_vram <= gpu_headroom) {
+            max_tokens_gpu = floor_ctx;
+        } else {
+            const uint64_t avail_vram = free_vram - gpu_headroom;
+            const uint64_t gpu_bpt = static_cast<uint64_t>(gpu_layers) * static_cast<uint64_t>(bytes_per_layer_token);
+            max_tokens_gpu = avail_vram / gpu_bpt;
+        }
     }
 
-    uint64_t available_mem = usable_pool - headroom;
-    uint64_t max_tokens_64 = available_mem / static_cast<uint64_t>(bytes_per_token);
-    uint32_t safe_tokens = (max_tokens_64 > UINT32_MAX) ? UINT32_MAX : static_cast<uint32_t>(max_tokens_64);
+    uint64_t max_tokens_cpu = UINT64_MAX;
+    if (cpu_layers > 0 && free_sys_ram > 0) {
+        if (free_sys_ram <= cpu_headroom) {
+            max_tokens_cpu = floor_ctx;
+        } else {
+            const uint64_t avail_ram = free_sys_ram - cpu_headroom;
+            const uint64_t cpu_bpt = static_cast<uint64_t>(cpu_layers) * static_cast<uint64_t>(bytes_per_layer_token);
+            max_tokens_cpu = avail_ram / cpu_bpt;
+        }
+    } else if (gpu_layers > 0 && free_vram == 0 && free_sys_ram > 0) {
+        // Unified memory / fallback when VRAM query is unavailable
+        if (free_sys_ram <= cpu_headroom) {
+            max_tokens_cpu = floor_ctx;
+        } else {
+            const uint64_t avail_ram = free_sys_ram - cpu_headroom;
+            const uint64_t total_bpt = static_cast<uint64_t>(n_layer) * static_cast<uint64_t>(bytes_per_layer_token);
+            max_tokens_cpu = avail_ram / total_bpt;
+        }
+    }
 
-    uint32_t floor_ctx = std::min<uint32_t>(target_ctx, 2048);
+    const uint64_t max_tokens_64 = std::min<uint64_t>(max_tokens_gpu, max_tokens_cpu);
+    const uint32_t safe_tokens = (max_tokens_64 > UINT32_MAX) ? UINT32_MAX : static_cast<uint32_t>(max_tokens_64);
+
     return std::max<uint32_t>(floor_ctx, std::min<uint32_t>(target_ctx, safe_tokens));
-}
-
-
+	 
+	 
 
 template <typename T, typename = void>
 struct has_flash_attn_bool : std::false_type {};
@@ -1308,6 +1390,16 @@ UniqueSampler create_sampler(
         return UniqueSampler(nullptr, &llama_sampler_free);
     }
 
+    auto add_sampler_checked = [&](struct llama_sampler* s, const char* name) -> bool {
+        if (!s) {
+            err_out = std::string("Failed to initialize sampler stage: ") + name;
+            if (penalty_smpl_out) *penalty_smpl_out = nullptr;
+            return false;
+        }
+        llama_sampler_chain_add(chain.get(), s);
+        return true;
+    };
+
     const struct llama_vocab* vocab = model ? llama_model_get_vocab(model) : nullptr;
 
     if (params.repeat_penalty > 0.0f && params.repeat_penalty != 1.0f && vocab) {
@@ -1334,20 +1426,30 @@ UniqueSampler create_sampler(
     }
 
     if (params.top_k > 0) {
-        llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(params.top_k));
+        if (!add_sampler_checked(llama_sampler_init_top_k(params.top_k), "top_k")) {
+            return UniqueSampler(nullptr, &llama_sampler_free);
+        }
     }
     if (params.top_p > 0.0f && params.top_p < 1.0f) {
-        llama_sampler_chain_add(chain.get(), llama_sampler_init_top_p(params.top_p, 1));
+        if (!add_sampler_checked(llama_sampler_init_top_p(params.top_p, 1), "top_p")) {
+            return UniqueSampler(nullptr, &llama_sampler_free);
+        }
     }
     if (params.min_p > 0.0f && params.min_p < 1.0f) {
-        llama_sampler_chain_add(chain.get(), llama_sampler_init_min_p(params.min_p, 1));
+        if (!add_sampler_checked(llama_sampler_init_min_p(params.min_p, 1), "min_p")) {
+            return UniqueSampler(nullptr, &llama_sampler_free);
+        }
     }
 
     if (params.temperature > 0.0f) {
-        llama_sampler_chain_add(chain.get(), llama_sampler_init_temp(params.temperature));
-        llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(params.seed ? params.seed : LLAMA_DEFAULT_SEED));
+        if (!add_sampler_checked(llama_sampler_init_temp(params.temperature), "temp") ||
+            !add_sampler_checked(llama_sampler_init_dist(params.seed ? params.seed : LLAMA_DEFAULT_SEED), "dist")) {
+            return UniqueSampler(nullptr, &llama_sampler_free);
+        }
     } else {
-        llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());
+        if (!add_sampler_checked(llama_sampler_init_greedy(), "greedy")) {
+            return UniqueSampler(nullptr, &llama_sampler_free);
+        }
     }
 
     return chain;
@@ -1419,8 +1521,9 @@ void free_model_resources_locked(infer_ctx* ctx) {
         ctx->model = nullptr;
     }
     ctx->special_lookup.clear();
-    ctx->n_ctx  = 0;
-    ctx->n_keep = 0;
+    ctx->model_fingerprint = 0;
+    ctx->n_ctx             = 0;
+    ctx->n_keep            = 0;
     ctx->n_past.store(0, std::memory_order_relaxed);
     ctx->chat_history.clear();
     ctx->active_kv_tokens.clear();
@@ -1455,6 +1558,12 @@ bool execute_decode(
             prefix_len--;
         }
 
+        const size_t tokens_to_add = prompt_tokens.size() - prefix_len;
+        if (tokens_to_add >= static_cast<size_t>(ctx->n_ctx)) {
+            ctx->set_error("Prompt tokens exceed context capacity.");
+            return false;
+        }
+
         if (prefix_len < current_past_sz || prefix_len < ctx->active_kv_tokens.size()) {
             if (!safe_kv_seq_rm(ctx, 0, static_cast<int>(prefix_len), -1)) {
                 prefix_len = 0;
@@ -1465,9 +1574,9 @@ bool execute_decode(
         }
 
         int current_past = ctx->n_past.load(std::memory_order_relaxed);
-        size_t tokens_to_add = prompt_tokens.size() - prefix_len;
+        const size_t actual_tokens_to_add = prompt_tokens.size() - prefix_len;
 
-        while (static_cast<uint32_t>(current_past + tokens_to_add) >= ctx->n_ctx) {
+        while (static_cast<uint64_t>(current_past) + actual_tokens_to_add >= static_cast<uint64_t>(ctx->n_ctx)) {
             if (!llama_memory_can_shift(llama_get_memory(ctx->lctx))) {
                 ctx->set_error("Context full and KV cache does not support shifting.");
                 return false;
@@ -1479,7 +1588,15 @@ bool execute_decode(
                 ctx->set_error("Context capacity too small for shift management.");
                 return false;
             }
-            int needed = static_cast<int>(current_past + tokens_to_add - ctx->n_ctx + 16);
+            if (static_cast<uint64_t>(n_keep) + actual_tokens_to_add >= static_cast<uint64_t>(ctx->n_ctx)) {
+                ctx->set_error("Prompt does not fit in context even after shifting.");
+                return false;
+            }
+            int64_t needed_64 = static_cast<int64_t>(current_past) + static_cast<int64_t>(actual_tokens_to_add) -
+                                static_cast<int64_t>(ctx->n_ctx) + 16;
+            int needed = (needed_64 > static_cast<int64_t>(ctx->n_ctx))
+                             ? static_cast<int>(ctx->n_ctx)
+                             : static_cast<int>(std::max<int64_t>(1, needed_64));
             int n_discard = std::max(needed, (static_cast<int>(ctx->n_ctx) - n_keep) / 2);
             if (current_past - n_discard <= n_keep) {
                 n_discard = current_past - n_keep;
@@ -1507,6 +1624,10 @@ bool execute_decode(
             ctx->n_past.store(current_past, std::memory_order_relaxed);
         }
     } else {
+        if (prompt_tokens.size() >= static_cast<size_t>(ctx->n_ctx)) {
+            ctx->set_error("Prompt tokens exceed context capacity.");
+            return false;
+        }
         invalidate_kv(ctx);
     }
 
@@ -1514,9 +1635,14 @@ bool execute_decode(
         llama_sampler_reset(ctx->sampler);
     }
 
-    if (ctx->penalty_smpl) {
-        for (llama_token t : prompt_tokens) {
-            llama_sampler_accept(ctx->penalty_smpl, t);
+    if (ctx->penalty_smpl && !prompt_tokens.empty()) {
+        const int32_t max_window = (ctx->n_ctx > 0) ? static_cast<int32_t>(std::min<uint32_t>(ctx->n_ctx, 65536u)) : 4096;
+        int32_t last_n = (ctx->sampler_params.repeat_last_n <= 0) ? 64 : ctx->sampler_params.repeat_last_n;
+        last_n = std::min(last_n, max_window);
+        const size_t window = static_cast<size_t>(std::max<int32_t>(1, last_n));
+        const size_t start_idx = (prompt_tokens.size() > window) ? (prompt_tokens.size() - window) : 0;
+        for (size_t i = start_idx; i < prompt_tokens.size(); ++i) {
+            llama_sampler_accept(ctx->penalty_smpl, prompt_tokens[i]);
         }
     }
 
@@ -1526,9 +1652,10 @@ bool execute_decode(
         ctx->n_keep = std::min<int>(static_cast<int>(prompt_tokens.size()), static_cast<int>(ctx->n_ctx) / 4);
     }
 
-    std::vector<llama_token> delta_prompt(prompt_tokens.begin() + prefix_len, prompt_tokens.end());
+    const size_t delta_size = prompt_tokens.size() - prefix_len;
+    const llama_token* delta_ptr = prompt_tokens.data() + prefix_len;
 
-    if (static_cast<uint32_t>(start_past + delta_prompt.size()) >= ctx->n_ctx) {
+    if (static_cast<uint64_t>(start_past) + delta_size >= static_cast<uint64_t>(ctx->n_ctx)) {
         ctx->set_error("Prompt tokens exceed context capacity.");
         return false;
     }
@@ -1541,23 +1668,23 @@ bool execute_decode(
 
     PrefillRollbackGuard prefill_guard{ctx, start_past, false};
 
-    if (!delta_prompt.empty()) {
-        for (size_t i = 0; i < delta_prompt.size(); ) {
+    if (delta_size > 0) {
+        for (size_t i = 0; i < delta_size; ) {
             if (ctx->abort_flag.load(std::memory_order_relaxed)) {
                 ctx->set_error("Generation aborted during prompt prefill.");
                 return false;
             }
 
             batch.n_tokens = 0;
-            int chunk = std::min<int>(effective_batch_cap, static_cast<int>(delta_prompt.size() - i));
+            int chunk = std::min<int>(effective_batch_cap, static_cast<int>(delta_size - i));
 
             for (int j = 0; j < chunk; ++j) {
                 size_t idx = i + static_cast<size_t>(j);
-                batch.token[j]     = delta_prompt[idx];
+                batch.token[j]     = delta_ptr[idx];
                 batch.pos[j]       = static_cast<llama_pos>(start_past + static_cast<int>(idx));
                 batch.n_seq_id[j]  = 1;
                 batch.seq_id[j][0] = 0;
-                batch.logits[j]    = (idx == delta_prompt.size() - 1);
+                batch.logits[j]    = (idx == delta_size - 1);
                 batch.n_tokens++;
             }
 
@@ -1569,12 +1696,12 @@ bool execute_decode(
             i += static_cast<size_t>(chunk);
         }
 
-        ctx->active_kv_tokens.insert(ctx->active_kv_tokens.end(), delta_prompt.begin(), delta_prompt.end());
+        ctx->active_kv_tokens.insert(ctx->active_kv_tokens.end(), delta_ptr, delta_ptr + delta_size);
     }
 
     prefill_guard.completed = true;
 
-    int n_cur = start_past + static_cast<int>(delta_prompt.size());
+    int n_cur = start_past + static_cast<int>(delta_size);
     ctx->n_past.store(n_cur, std::memory_order_relaxed);
 
     std::vector<std::string> active_stops;
@@ -1654,6 +1781,7 @@ bool execute_decode(
 
             if (track_stops) {
                 std::vector<std::pair<int, size_t>> new_tok_log;
+                new_tok_log.reserve(tok_log.size());
                 for (const auto& e : tok_log) {
                     if (e.first < n_keep) {
                         new_tok_log.push_back(e);
@@ -1719,7 +1847,7 @@ bool execute_decode(
                     rollback_stop_tokens(out_buf.stop_offset());
                 }
 
-                if (append_to_existing_past && n_cur > 0) {
+                if (append_to_existing_past && n_cur > 0 && !out_buf.user_aborted()) {
                     llama_token term_token = llama_vocab_eot(vocab);
                     if (term_token == LLAMA_TOKEN_NULL) {
                         term_token = llama_vocab_eos(vocab);
@@ -1764,7 +1892,7 @@ bool execute_decode(
         ctx->n_past.store(n_cur, std::memory_order_relaxed);
     }
 
-    if (generated_tokens >= token_limit && append_to_existing_past && n_cur > 0) {
+    if (generated_tokens >= token_limit && append_to_existing_past && n_cur > 0 && execution_success) {
         llama_token term_token = llama_vocab_eot(vocab);
         if (term_token == LLAMA_TOKEN_NULL) {
             term_token = llama_vocab_eos(vocab);
@@ -1979,12 +2107,16 @@ bool infer_unload_model(infer_ctx* ctx) {
     }
 }
 
-
-
-
 bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_params* params) {
-    if (!ctx || !path || !params) {
-        if (ctx) ctx->set_error("Null path or parameters in infer_load_model_ex.");
+    if (!ctx) return false;
+    GenAcquireGuard gen_guard(ctx);
+    if (!gen_guard.acquired) {
+        ctx->set_error("Cannot load model while context is busy.");
+        return false;
+    }
+
+    if (!path || !params) {
+        ctx->set_error("Null path or parameters in infer_load_model_ex.");
         return false;
     }
     if (params->struct_size == 0) {
@@ -1999,12 +2131,6 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
 
     if (mparams.requested_ctx != 0 && mparams.requested_ctx < 256) {
         ctx->set_error("Requested context size too small (minimum 256).");
-        return false;
-    }
-
-    GenAcquireGuard gen_guard(ctx);
-    if (!gen_guard.acquired) {
-        ctx->set_error("Cannot load model while context is busy.");
         return false;
     }
 
@@ -2040,9 +2166,9 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
         const bool auto_layers = (mparams.n_gpu_layers < 0 || mparams.n_gpu_layers >= 999);
         int32_t target_gpu_layers = auto_layers ? 999 : mparams.n_gpu_layers;
 
-        // INCREASED RESERVE: Prevents Windows WDDM from paging VRAM to system RAM (which causes the freeze)
-        constexpr uint64_t KV_AND_COMPUTE_VRAM_RESERVE = 1536ULL * 1024ULL * 1024ULL; // 1.5 GB reserve
-        
+        // Reserve 1.5 GiB to prevent Windows WDDM from paging VRAM to system RAM
+        constexpr uint64_t KV_AND_COMPUTE_VRAM_RESERVE = 1536ULL * 1024ULL * 1024ULL;
+
         if (auto_layers && free_vram > 0 && model_file_bytes > 0) {
             if (free_vram <= KV_AND_COMPUTE_VRAM_RESERVE) {
                 target_gpu_layers = 0; // Not enough free VRAM; safely fall back to CPU/System RAM
@@ -2050,7 +2176,6 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
                 uint64_t vram_budget_for_weights = free_vram - KV_AND_COMPUTE_VRAM_RESERVE;
                 if (model_file_bytes > vram_budget_for_weights) {
                     double fit_ratio = static_cast<double>(vram_budget_for_weights) / static_cast<double>(model_file_bytes);
-                    // FIXED ESTIMATE: Llama 3.2 3B has 28 layers. Overestimating pushes too much to GPU.
                     int32_t est_total_layers = (model_file_bytes > 4800ULL * 1024ULL * 1024ULL) ? 32 : 28;
                     target_gpu_layers = std::max<int32_t>(1, static_cast<int32_t>(fit_ratio * est_total_layers));
                 }
@@ -2145,14 +2270,17 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
         SpecialTokenLookup new_lookup;
         new_lookup.build(specials);
 
-        ctx->model          = new_model.release();
-        ctx->lctx           = new_lctx.release();
-        ctx->sampler        = new_sampler.release();
-        ctx->penalty_smpl   = new_pen;
-        ctx->special_lookup = std::move(new_lookup);
-        ctx->n_ctx          = new_n_ctx;
+        const uint64_t new_fingerprint = compute_model_fingerprint(new_model.get());
+
+        ctx->model             = new_model.release();
+        ctx->lctx              = new_lctx.release();
+        ctx->sampler           = new_sampler.release();
+        ctx->penalty_smpl      = new_pen;
+        ctx->special_lookup    = std::move(new_lookup);
+        ctx->model_fingerprint = new_fingerprint;
+        ctx->n_ctx             = new_n_ctx;
         ctx->n_past.store(0, std::memory_order_relaxed);
-        ctx->n_keep         = 0;
+        ctx->n_keep            = 0;
         if (mparams.chat_template) {
             ctx->custom_chat_template = mparams.chat_template;
         }
@@ -2167,9 +2295,6 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
     }
 }
 
-
-
-
 bool infer_load_model(infer_ctx* ctx, const char* path, uint32_t requested_ctx) {
     infer_model_params params = infer_model_default_params();
     params.requested_ctx       = requested_ctx;
@@ -2179,14 +2304,14 @@ bool infer_load_model(infer_ctx* ctx, const char* path, uint32_t requested_ctx) 
 
 bool infer_set_sampler(infer_ctx* ctx, const infer_sampler_params* params) {
     if (!ctx || !params) return false;
-    if (params->struct_size == 0) {
-        ctx->set_error("Invalid infer_sampler_params struct_size (must be non-zero).");
-        return false;
-    }
-
     GenAcquireGuard gen_guard(ctx);
     if (!gen_guard.acquired) {
         ctx->set_error("Cannot change sampler while context is busy.");
+        return false;
+    }
+
+    if (params->struct_size == 0) {
+        ctx->set_error("Invalid infer_sampler_params struct_size (must be non-zero).");
         return false;
     }
 
@@ -2520,7 +2645,7 @@ bool infer_state_save(infer_ctx* ctx, const char* filepath) {
         header.n_embd        = static_cast<uint32_t>(llama_model_n_embd(ctx->model));
         header.n_layer       = static_cast<uint32_t>(llama_model_n_layer(ctx->model));
         header.n_head        = static_cast<uint32_t>(llama_model_n_head(ctx->model));
-        header.fingerprint   = compute_model_fingerprint(ctx->model);
+        header.fingerprint   = ctx->model_fingerprint ? ctx->model_fingerprint : compute_model_fingerprint(ctx->model);
         header.payload_crc   = 0;
         header.history_bytes = static_cast<uint32_t>(hist_buf.size());
         header.data_size     = static_cast<uint64_t>(kv_buffer.size()) + static_cast<uint64_t>(hist_buf.size());
@@ -2611,7 +2736,7 @@ bool infer_state_load(infer_ctx* ctx, const char* filepath) {
 
         const struct llama_vocab* vocab = llama_model_get_vocab(ctx->model);
         uint32_t current_vocab = vocab ? static_cast<uint32_t>(llama_vocab_n_tokens(vocab)) : 0;
-        uint64_t current_fp = compute_model_fingerprint(ctx->model);
+        uint64_t current_fp = ctx->model_fingerprint ? ctx->model_fingerprint : compute_model_fingerprint(ctx->model);
 
         if (header.magic != STATE_MAGIC ||
             header.version != STATE_VERSION ||
@@ -2793,6 +2918,7 @@ bool infer_get_embeddings_ex(infer_ctx* ctx, const char* text, float* out_vec, s
         return false;
     }
 
+    ctx->abort_flag.store(false, std::memory_order_release);
     ctx->clear_error();
     ctx->last_success.store(false, std::memory_order_release);
 
@@ -3258,21 +3384,16 @@ bool infer_generate_chat_turn_v2(
                 return false;
             }
 
-            bool add_bos = want_bos(vocab, formatted.c_str());
+             bool add_bos = want_bos(vocab, formatted.c_str());
+            std::vector<llama_token> prompt_tokens;
             int32_t n_tokens = 0;
-            if (!tokenize_checked(vocab, formatted.c_str(), formatted.size(), add_bos, true, nullptr, &n_tokens) ||
-                n_tokens <= 0) {
+            if (!tokenize_checked(vocab, formatted.c_str(), formatted.size(), add_bos, true, &prompt_tokens, &n_tokens) ||
+                n_tokens <= 0 || prompt_tokens.empty()) {
                 ctx->set_error("Tokenization calculation failed.");
                 return false;
             }
 
             if (static_cast<uint32_t>(n_tokens) <= max_prompt_budget) {
-                std::vector<llama_token> prompt_tokens;
-                if (!tokenize_checked(vocab, formatted.c_str(), formatted.size(), add_bos, true, &prompt_tokens) ||
-                    prompt_tokens.empty()) {
-                    ctx->set_error("Failed to tokenize chat turn.");
-                    return false;
-                }
 
                 const int prev_past = ctx->n_past.load(std::memory_order_relaxed);
                 std::string generated_response;
