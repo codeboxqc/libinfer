@@ -362,7 +362,11 @@ void internal_ggml_log(enum ggml_log_level level, const char* text, void* user_d
         data = g_user_log_data;
     }
     if (cb) {
-        cb(map_log_level(level), text, data);
+        try {
+            cb(map_log_level(level), text, data);
+        } catch (...) {
+            // Swallow all exceptions to prevent crossing the C ABI boundary
+        }
     }
 }
 
@@ -1002,6 +1006,9 @@ struct infer_ctx {
     struct llama_sampler* penalty_smpl = nullptr;
 
     infer_sampler_params     sampler_params{};
+    infer_model_params       loaded_model_params{};
+    std::string              loaded_model_path;
+    int32_t                  loaded_gpu_layers = 0;
     std::string              grammar_gbnf;
     std::string              custom_chat_template;
     std::vector<std::string> stop_words;
@@ -1013,6 +1020,7 @@ struct infer_ctx {
     std::atomic<int>             n_past{0};
     std::atomic<bool>            abort_flag{false};
     std::atomic<bool>            is_generating{false};
+    std::atomic<bool>            shutting_down{false};
     std::atomic<bool>            last_success{true};
     std::atomic<std::thread::id> active_gen_thread_id{};
 
@@ -1074,9 +1082,13 @@ struct GenAcquireGuard {
     bool acquired  = false;
 
     explicit GenAcquireGuard(infer_ctx* c) : ctx(c) {
-        if (!ctx) return;
+        if (!ctx || ctx->shutting_down.load(std::memory_order_acquire)) return;
         bool expected = false;
         if (ctx->is_generating.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            if (ctx->shutting_down.load(std::memory_order_acquire)) {
+                release_gen(ctx);
+                return;
+            }
             ctx->active_gen_thread_id.store(std::this_thread::get_id(), std::memory_order_release);
             acquired = true;
         }
@@ -1106,6 +1118,16 @@ struct PrefillRollbackGuard {
     }
 };
 
+ 
+
+
+bool internal_abort_cb(void* data) {
+    auto* ctx = static_cast<infer_ctx*>(data);
+    if (!ctx) return false;
+    return ctx->abort_flag.load(std::memory_order_relaxed) ||
+           ctx->shutting_down.load(std::memory_order_relaxed);
+}
+
 bool infer_has_real_gpu() {
     size_t count = ggml_backend_dev_count();
     for (size_t i = 0; i < count; ++i) {
@@ -1117,16 +1139,22 @@ bool infer_has_real_gpu() {
     return false;
 }
 
-int32_t pick_threads(bool has_gpu, bool batch_phase) {
-    (void)has_gpu;
-    (void)batch_phase;
+int32_t pick_threads(bool full_gpu_offload, bool batch_phase) {
     if (g_cached_env_threads > 0) {
         return g_cached_env_threads;
     }
     uint32_t phys = (g_cached_phys_cores > 0) ? g_cached_phys_cores : detect_physical_cores();
-    return static_cast<int32_t>(phys > 0 ? phys : 4);
+    uint32_t base = (phys > 0) ? phys : 4;
+    if (full_gpu_offload && !batch_phase) {
+        return static_cast<int32_t>(std::min<uint32_t>(base, 4u));
+    }
+    return static_cast<int32_t>(base);
 }
-
+ 
+ 
+ 
+ 
+ 
 enum ggml_type map_kv_type(int32_t kv_type) {
     switch (kv_type) {
         case INFER_KV_TYPE_F16:     return GGML_TYPE_F16;
@@ -1157,35 +1185,50 @@ uint32_t calculate_safe_n_ctx(
     enum ggml_type type_k,
     enum ggml_type type_v
 ) {
+    constexpr uint32_t CONSERVATIVE_FALLBACK_CTX = 512;
+
+    if (!model) {
+        return (requested_ctx > 0) ? std::min<uint32_t>(requested_ctx, CONSERVATIVE_FALLBACK_CTX) : CONSERVATIVE_FALLBACK_CTX;
+    }
+
     uint32_t max_train = static_cast<uint32_t>(llama_model_n_ctx_train(model));
 
     uint64_t total_vram = 0;
     uint64_t free_vram  = 0;
-    size_t dev_count = ggml_backend_dev_count();
+    size_t dev_count  = ggml_backend_dev_count();
+    size_t dgpu_count = 0;
+    for (size_t i = 0; i < dev_count; ++i) {
+        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            dgpu_count++;
+        }
+    }
     for (size_t i = 0; i < dev_count; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         auto dtype = ggml_backend_dev_type(dev);
-        if (dtype == GGML_BACKEND_DEVICE_TYPE_GPU || dtype == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        const bool use_dev = (dgpu_count > 0)
+                                 ? (dtype == GGML_BACKEND_DEVICE_TYPE_GPU)
+                                 : (dtype == GGML_BACKEND_DEVICE_TYPE_GPU || dtype == GGML_BACKEND_DEVICE_TYPE_IGPU);
+        if (use_dev) {
             size_t dev_free = 0, dev_total = 0;
             ggml_backend_dev_memory(dev, &dev_free, &dev_total);
             total_vram += static_cast<uint64_t>(dev_total);
             free_vram  += static_cast<uint64_t>(dev_free);
         }
     }
+	
+	
 
     uint64_t free_sys_ram = query_system_free_ram();
 
-    // Auto-select target context from GPU VRAM + System RAM
-    uint32_t auto_tier_ctx = DEFAULT_FALLBACK_CTX; // 4096 default (6 GB GPU)
+    uint32_t auto_tier_ctx = DEFAULT_FALLBACK_CTX;
     if (total_vram == 0 || n_gpu_layers == 0) {
-        // CPU-only mode: scale with System RAM (8192 if >= 12 GB free RAM, else 4096)
         auto_tier_ctx = (free_sys_ram >= (12000ULL * 1024ULL * 1024ULL)) ? 8192 : 4096;
     } else if (total_vram <= (4600ULL * 1024ULL * 1024ULL)) {
-        auto_tier_ctx = 2048;  // <= 4 GB GPU
+        auto_tier_ctx = 2048;
     } else if (total_vram >= (14000ULL * 1024ULL * 1024ULL)) {
-        auto_tier_ctx = 16384; // >= 16 GB GPU
+        auto_tier_ctx = 16384;
     } else if (total_vram >= (7500ULL * 1024ULL * 1024ULL)) {
-        auto_tier_ctx = 8192;  // 8 GB - 12 GB GPU
+        auto_tier_ctx = 8192;
     }
 
     uint32_t target_ctx = (requested_ctx > 0) ? requested_ctx : auto_tier_ctx;
@@ -1193,13 +1236,15 @@ uint32_t calculate_safe_n_ctx(
         target_ctx = std::min<uint32_t>(target_ctx, max_train);
     }
 
+    const uint32_t fallback_ctx = std::min<uint32_t>(target_ctx, CONSERVATIVE_FALLBACK_CTX);
+
     int32_t n_layer   = llama_model_n_layer(model);
     int32_t n_head_kv = llama_model_n_head_kv(model);
     int32_t n_head    = llama_model_n_head(model);
     int32_t n_embd    = llama_model_n_embd(model);
 
     if (n_head <= 0 || n_layer <= 0 || n_head_kv <= 0 || n_embd <= 0) {
-        return target_ctx;
+        return fallback_ctx;
     }
 
     int32_t default_head_dim = n_embd / n_head;
@@ -1220,7 +1265,7 @@ uint32_t calculate_safe_n_ctx(
     const size_t bytes_per_layer_token = row_bytes_k + row_bytes_v;
 
     if (bytes_per_layer_token == 0) {
-        return target_ctx;
+        return fallback_ctx;
     }
 
     const int32_t gpu_layers = (total_vram > 0 && n_gpu_layers != 0)
@@ -1229,28 +1274,21 @@ uint32_t calculate_safe_n_ctx(
     const int32_t cpu_layers = n_layer - gpu_layers;
 
     if (gpu_layers == 0 && free_sys_ram == 0) {
-        return target_ctx;
+        return fallback_ctx;
     }
     if (gpu_layers > 0 && free_vram == 0 && free_sys_ram == 0) {
-        return target_ctx;
+        return fallback_ctx;
     }
 
-    // Reserve >= 1 GiB (or 1/8 of total VRAM on large GPUs) for compute buffers so Windows WDDM
-    // never spills GPU KV allocations into shared system memory.
     const uint64_t gpu_headroom = (total_vram > 0)
         ? std::max<uint64_t>(1024ULL * 1024ULL * 1024ULL, total_vram / 8)
         : 1024ULL * 1024ULL * 1024ULL;
     const uint64_t cpu_headroom = 1024ULL * 1024ULL * 1024ULL;
 
-     
-	 
-	 
-	 const uint32_t floor_ctx = std::min<uint32_t>(target_ctx, 1024u);
-
     uint64_t max_tokens_gpu = UINT64_MAX;
     if (gpu_layers > 0 && free_vram > 0) {
         if (free_vram <= gpu_headroom) {
-            max_tokens_gpu = floor_ctx;
+            max_tokens_gpu = 0;
         } else {
             const uint64_t avail_vram = free_vram - gpu_headroom;
             const uint64_t gpu_bpt = static_cast<uint64_t>(gpu_layers) * static_cast<uint64_t>(bytes_per_layer_token);
@@ -1261,16 +1299,15 @@ uint32_t calculate_safe_n_ctx(
     uint64_t max_tokens_cpu = UINT64_MAX;
     if (cpu_layers > 0 && free_sys_ram > 0) {
         if (free_sys_ram <= cpu_headroom) {
-            max_tokens_cpu = floor_ctx;
+            max_tokens_cpu = 0;
         } else {
             const uint64_t avail_ram = free_sys_ram - cpu_headroom;
             const uint64_t cpu_bpt = static_cast<uint64_t>(cpu_layers) * static_cast<uint64_t>(bytes_per_layer_token);
             max_tokens_cpu = avail_ram / cpu_bpt;
         }
     } else if (gpu_layers > 0 && free_vram == 0 && free_sys_ram > 0) {
-        // Unified memory / fallback when VRAM query is unavailable
         if (free_sys_ram <= cpu_headroom) {
-            max_tokens_cpu = floor_ctx;
+            max_tokens_cpu = 0;
         } else {
             const uint64_t avail_ram = free_sys_ram - cpu_headroom;
             const uint64_t total_bpt = static_cast<uint64_t>(n_layer) * static_cast<uint64_t>(bytes_per_layer_token);
@@ -1281,8 +1318,10 @@ uint32_t calculate_safe_n_ctx(
     const uint64_t max_tokens_64 = std::min<uint64_t>(max_tokens_gpu, max_tokens_cpu);
     const uint32_t safe_tokens = (max_tokens_64 > UINT32_MAX) ? UINT32_MAX : static_cast<uint32_t>(max_tokens_64);
 
-    return std::max<uint32_t>(floor_ctx, std::min<uint32_t>(target_ctx, safe_tokens));
+    return std::min<uint32_t>(target_ctx, safe_tokens);
 }
+
+
 
 template <typename T, typename = void>
 struct has_flash_attn_bool : std::false_type {};
@@ -1645,11 +1684,16 @@ bool execute_decode(
         }
     }
 
-    int start_past = append_to_existing_past ? ctx->n_past.load(std::memory_order_relaxed) : 0;
 
-    if (start_past == 0) {
+
+int start_past = append_to_existing_past ? ctx->n_past.load(std::memory_order_relaxed) : 0;
+
+    if (start_past == 0 && ctx->n_keep <= 0) {
         ctx->n_keep = std::min<int>(static_cast<int>(prompt_tokens.size()), static_cast<int>(ctx->n_ctx) / 4);
     }
+	
+	
+   
 
     const size_t delta_size = prompt_tokens.size() - prefix_len;
     const llama_token* delta_ptr = prompt_tokens.data() + prefix_len;
@@ -1659,11 +1703,27 @@ bool execute_decode(
         return false;
     }
 
+  if (effective_batch_cap <= 0) {
+        ctx->set_error("Invalid effective batch capacity.");
+        return false;
+    }
+
     struct llama_batch batch = llama_batch_init(effective_batch_cap, 0, 1);
     struct BatchGuard {
         struct llama_batch& b;
         ~BatchGuard() { llama_batch_free(b); }
     } batch_guard{batch};
+
+    if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+        ctx->set_error("Failed to allocate llama_batch internal buffers.");
+        return false;
+    }
+    for (int k = 0; k < effective_batch_cap; ++k) {
+        if (!batch.seq_id[k]) {
+            ctx->set_error("Failed to allocate llama_batch sequence ID array.");
+            return false;
+        }
+    }
 
     PrefillRollbackGuard prefill_guard{ctx, start_past, false};
 
@@ -1876,11 +1936,17 @@ bool execute_decode(
         batch.seq_id[0][0] = 0;
         batch.logits[0]    = true;
         batch.n_tokens     = 1;
-
-        if (llama_decode(ctx->lctx, batch) != 0) {
+ 
+ if (llama_decode(ctx->lctx, batch) != 0) {
             out_buf.flush_remaining();
-            ctx->set_error("llama_decode failed during token generation.");
-            ctx->n_past.store(n_cur, std::memory_order_relaxed);
+            if (safe_kv_seq_rm(ctx, 0, n_cur, -1)) {
+                ctx->n_past.store(n_cur, std::memory_order_relaxed);
+            }
+            if (ctx->abort_flag.load(std::memory_order_relaxed) || ctx->shutting_down.load(std::memory_order_relaxed)) {
+                ctx->set_error("Generation aborted by caller.");
+            } else {
+                ctx->set_error("llama_decode failed during token generation.");
+            }
             return false;
         }
 
@@ -1966,7 +2032,9 @@ bool infer_generate_chat_internal(
         return false;
     }
 
-    bool add_bos = want_bos(vocab, formatted.c_str());
+ 
+ 
+ bool add_bos = want_bos(vocab, formatted.c_str());
     std::vector<llama_token> prompt_tokens;
     if (!tokenize_checked(vocab, formatted.c_str(), formatted.size(), add_bos, true, &prompt_tokens) ||
         prompt_tokens.empty()) {
@@ -1974,7 +2042,28 @@ bool infer_generate_chat_internal(
         return false;
     }
 
+ size_t sys_count = 0;
+    while (sys_count < llama_msgs.size() &&
+           ( std::strcmp(llama_msgs[sys_count].role, "system") == 0 ||
+             std::strcmp(llama_msgs[sys_count].role, "developer") == 0 )) {
+        sys_count++;
+    }
+    ctx->n_keep = 0;
+    if (sys_count > 0) {
+        std::vector<struct llama_chat_message> sys_msgs(llama_msgs.begin(), llama_msgs.begin() + static_cast<std::ptrdiff_t>(sys_count));
+        std::string sys_formatted;
+        if (render_chat_template_with_fallback(ctx, sys_msgs, sys_formatted)) {
+            int32_t sys_toks = 0;
+            if (tokenize_checked(vocab, sys_formatted.c_str(), sys_formatted.size(), add_bos, true, nullptr, &sys_toks) && sys_toks > 0) {
+                ctx->n_keep = std::min<int>(sys_toks, static_cast<int>(ctx->n_ctx) / 2);
+            }
+        }
+    }
+
     std::string generated_response;
+ 
+ 
+ 
     bool res = execute_decode(ctx, prompt_tokens, true, max_tokens, callback, user_data, &generated_response);
     if (ctx->n_past.load(std::memory_order_relaxed) > 0) {
         if (res) {
@@ -2034,6 +2123,9 @@ infer_model_params infer_model_default_params(void) {
     p.kv_type_v           = INFER_KV_TYPE_F16;
     p.allow_ctx_reduction = false;
     p.chat_template       = nullptr;
+    std::memset(p.tensor_split, 0, sizeof(p.tensor_split));
+    p.main_gpu            = 0;
+    p.split_mode          = 1;
     return p;
 }
 
@@ -2084,8 +2176,14 @@ infer_ctx* infer_init(void) {
     return infer_init_ex(nullptr, 0);
 }
 
-bool infer_unload_model(infer_ctx* ctx) {
+ 
+
+ bool infer_unload_model(infer_ctx* ctx) {
     if (!ctx) return false;
+    if (ctx->shutting_down.load(std::memory_order_acquire)) {
+        ctx->set_error("Cannot unload model while context is shutting down.");
+        return false;
+    }
     GenAcquireGuard gen_guard(ctx);
     if (!gen_guard.acquired) {
         ctx->set_error("Cannot unload model while context is busy.");
@@ -2096,6 +2194,9 @@ bool infer_unload_model(infer_ctx* ctx) {
         std::lock_guard<std::mutex> lock(ctx->ctx_mutex);
         ctx->clear_error();
         free_model_resources_locked(ctx);
+        ctx->loaded_model_path.clear();
+        ctx->loaded_model_params = infer_model_default_params();
+        ctx->loaded_gpu_layers   = 0;
         return true;
     } catch (const std::exception& e) {
         ctx->set_error(e.what());
@@ -2108,13 +2209,18 @@ bool infer_unload_model(infer_ctx* ctx) {
 
 bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_params* params) {
     if (!ctx) return false;
+    if (ctx->shutting_down.load(std::memory_order_acquire)) {
+        ctx->set_error("Cannot load model while context is shutting down.");
+        return false;
+    }
+
     GenAcquireGuard gen_guard(ctx);
     if (!gen_guard.acquired) {
         ctx->set_error("Cannot load model while context is busy.");
         return false;
     }
 
-    if (!path || !params) {
+    if (!path || !*path || !params) {
         ctx->set_error("Null path or parameters in infer_load_model_ex.");
         return false;
     }
@@ -2128,160 +2234,398 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
     std::memcpy(&mparams, params, copy_sz);
     mparams.struct_size = sizeof(infer_model_params);
 
+   
+   double split_weight_sum = 0.0;
+    for (size_t i = 0; i < 128; ++i) {
+        if (std::isnan(mparams.tensor_split[i]) || std::isinf(mparams.tensor_split[i]) || mparams.tensor_split[i] < 0.0f) {
+            mparams.tensor_split[i] = 0.0f;
+        }
+        split_weight_sum += static_cast<double>(mparams.tensor_split[i]);
+    }
+
+    // If caller did not set custom tensor_split and both discrete GPU and slow iGPU exist,
+    // automatically exclude the iGPU so it never bottlenecks the discrete GPU.
+    if (split_weight_sum == 0.0 && mparams.split_mode != 0) {
+        size_t dgpu_count = 0;
+        size_t igpu_count = 0;
+        size_t dev_count  = ggml_backend_dev_count();
+        for (size_t i = 0; i < dev_count; ++i) {
+            auto dtype = ggml_backend_dev_type(ggml_backend_dev_get(i));
+            if (dtype == GGML_BACKEND_DEVICE_TYPE_GPU)  dgpu_count++;
+            if (dtype == GGML_BACKEND_DEVICE_TYPE_IGPU) igpu_count++;
+        }
+        if (dgpu_count > 0 && igpu_count > 0) {
+            size_t gpu_idx = 0;
+            for (size_t i = 0; i < dev_count && gpu_idx < 128; ++i) {
+                auto dtype = ggml_backend_dev_type(ggml_backend_dev_get(i));
+                if (dtype == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    mparams.tensor_split[gpu_idx++] = 1.0f;
+                    split_weight_sum += 1.0;
+                } else if (dtype == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    mparams.tensor_split[gpu_idx++] = 0.0f;
+                }
+            }
+        }
+    }
+    const bool has_custom_split = (split_weight_sum > 0.0);
+   
+   
+
     if (mparams.requested_ctx != 0 && mparams.requested_ctx < 256) {
         ctx->set_error("Requested context size too small (minimum 256).");
         return false;
     }
 
-    try {
+ try {
         std::lock_guard<std::mutex> lock(ctx->ctx_mutex);
+        if (ctx->shutting_down.load(std::memory_order_acquire)) {
+            ctx->set_error("Cannot load model while context is shutting down.");
+            return false;
+        }
+        ctx->abort_flag.store(false, std::memory_order_release);
         ctx->clear_error();
 
-        // 1. Free old model first so GPU VRAM reading is 100% accurate
-        free_model_resources_locked(ctx);
-
-        // 2. Measure GGUF file size on disk and free GPU VRAM for Hybrid GPU + RAM split
         uint64_t model_file_bytes = 0;
         {
             ScopedFile mf(open_file_utf8(path, "rb"));
-            if (mf) {
-                file_size_64(mf.get(), model_file_bytes);
+            if (!mf || !file_size_64(mf.get(), model_file_bytes) || model_file_bytes == 0) {
+                ctx->set_error("Failed to open or read model file from path: " + std::string(path));
+                return false;
             }
         }
 
-        uint64_t free_vram = 0;
-        size_t dev_count = ggml_backend_dev_count();
-        for (size_t i = 0; i < dev_count; ++i) {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            auto dtype = ggml_backend_dev_type(dev);
-            if (dtype == GGML_BACKEND_DEVICE_TYPE_GPU || dtype == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                size_t df = 0, dt = 0;
-                ggml_backend_dev_memory(dev, &df, &dt);
-                free_vram += static_cast<uint64_t>(df);
-            }
-        }
+        // Probe GGUF metadata and tensor sizes on CPU via mmap before touching the active model
+        struct llama_model_params probe_mparams = llama_model_default_params();
+        probe_mparams.n_gpu_layers = 0;
+        probe_mparams.main_gpu     = mparams.main_gpu;
+        probe_mparams.split_mode   = static_cast<enum llama_split_mode>(mparams.split_mode);
+        probe_mparams.tensor_split = has_custom_split ? mparams.tensor_split : nullptr;
+        apply_model_load_params(probe_mparams, true, false);
 
-        // Callers that pass 999 ("all layers") get the same VRAM-aware fitting as -1.
-        const bool auto_layers = (mparams.n_gpu_layers < 0 || mparams.n_gpu_layers >= 999);
-        int32_t target_gpu_layers = auto_layers ? 999 : mparams.n_gpu_layers;
-
-        // Reserve 1.5 GiB to prevent Windows WDDM from paging VRAM to system RAM
-        constexpr uint64_t KV_AND_COMPUTE_VRAM_RESERVE = 1536ULL * 1024ULL * 1024ULL;
-
-        if (auto_layers && free_vram > 0 && model_file_bytes > 0) {
-            if (free_vram <= KV_AND_COMPUTE_VRAM_RESERVE) {
-                target_gpu_layers = 0; // Not enough free VRAM; safely fall back to CPU/System RAM
-            } else {
-                uint64_t vram_budget_for_weights = free_vram - KV_AND_COMPUTE_VRAM_RESERVE;
-                if (model_file_bytes > vram_budget_for_weights) {
-                    double fit_ratio = static_cast<double>(vram_budget_for_weights) / static_cast<double>(model_file_bytes);
-                    int32_t est_total_layers = (model_file_bytes > 4800ULL * 1024ULL * 1024ULL) ? 32 : 28;
-                    target_gpu_layers = std::max<int32_t>(1, static_cast<int32_t>(fit_ratio * est_total_layers));
-                }
-            }
-        }
-
-        struct llama_model_params llama_mparams = llama_model_default_params();
-        llama_mparams.n_gpu_layers = target_gpu_layers;
-        apply_model_load_params(llama_mparams, mparams.use_mmap, mparams.use_mlock);
-
-        std::unique_ptr<llama_model, decltype(&llama_model_free)> new_model(
-            llama_model_load_from_file(path, llama_mparams), &llama_model_free);
-        if (!new_model) {
+        std::unique_ptr<llama_model, decltype(&llama_model_free)> probe_model(
+            llama_model_load_from_file(path, probe_mparams), &llama_model_free);
+        if (!probe_model) {
             ctx->set_error("Failed to load model from path: " + std::string(path));
             return false;
         }
 
-        const enum ggml_type type_k = map_kv_type(mparams.kv_type_k);
-        const enum ggml_type type_v = map_kv_type(mparams.kv_type_v);
+        const int32_t  actual_layers      = llama_model_n_layer(probe_model.get());
+        const uint64_t total_tensor_bytes = llama_model_size(probe_model.get());
+        const uint64_t total_params       = llama_model_n_params(probe_model.get());
+        const int32_t  n_embd             = llama_model_n_embd(probe_model.get());
+        const struct llama_vocab* pvocab  = llama_model_get_vocab(probe_model.get());
+        const int32_t  n_vocab            = pvocab ? llama_vocab_n_tokens(pvocab) : 0;
+        const uint32_t max_train          = static_cast<uint32_t>(llama_model_n_ctx_train(probe_model.get()));
 
-        uint32_t safe_ctx = calculate_safe_n_ctx(
-            new_model.get(), mparams.requested_ctx, llama_mparams.n_gpu_layers, type_k, type_v);
-
-        if (mparams.requested_ctx > 0 && safe_ctx < mparams.requested_ctx && !mparams.allow_ctx_reduction) {
+        if (mparams.requested_ctx > 0 && max_train > 0 && mparams.requested_ctx > max_train && !mparams.allow_ctx_reduction) {
             ctx->set_error("Requested context size (" + std::to_string(mparams.requested_ctx) +
-                           ") exceeds model training length or available memory budget (" +
-                           std::to_string(safe_ctx) + ").");
+                           ") exceeds model training length (" + std::to_string(max_train) + ").");
             return false;
         }
 
-        if (safe_ctx < 256) {
-            ctx->set_error("Context size too small (minimum 256).");
-            return false;
-        }
+        constexpr uint64_t KV_AND_COMPUTE_VRAM_RESERVE = 1536ULL * 1024ULL * 1024ULL;
+        const uint64_t effective_model_bytes = (total_tensor_bytes > 0) ? total_tensor_bytes : model_file_bytes;
 
-        const bool has_gpu = (llama_mparams.n_gpu_layers != 0) && infer_has_real_gpu();
-        const int32_t threads_gen   = pick_threads(has_gpu, false);
-        const int32_t threads_batch = pick_threads(has_gpu, true);
+        auto query_usable_vram = [&]() -> uint64_t {
+            uint64_t usable_sum = 0;
+            uint64_t split_bounded_usable = UINT64_MAX;
+            double active_dev_weight_sum = 0.0;
+            size_t gpu_idx = 0;
+            size_t dev_count = ggml_backend_dev_count();
 
+            std::vector<uint64_t> dev_avails;
+            for (size_t i = 0; i < dev_count; ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                auto dtype = ggml_backend_dev_type(dev);
+                if (dtype == GGML_BACKEND_DEVICE_TYPE_GPU || dtype == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    size_t df = 0, dt = 0;
+                    ggml_backend_dev_memory(dev, &df, &dt);
+                    uint64_t dev_avail = (static_cast<uint64_t>(df) > KV_AND_COMPUTE_VRAM_RESERVE)
+                                             ? (static_cast<uint64_t>(df) - KV_AND_COMPUTE_VRAM_RESERVE)
+                                             : 0;
+                    dev_avails.push_back(dev_avail);
+                    if (gpu_idx < 128 && mparams.tensor_split[gpu_idx] > 0.0f) {
+                        active_dev_weight_sum += static_cast<double>(mparams.tensor_split[gpu_idx]);
+                    }
+                    gpu_idx++;
+                }
+            }
+
+            if (dev_avails.empty()) return 0;
+
+            if (mparams.split_mode == 0) {
+                if (mparams.main_gpu >= 0 && static_cast<size_t>(mparams.main_gpu) < dev_avails.size()) {
+                    return dev_avails[static_cast<size_t>(mparams.main_gpu)];
+                }
+                return dev_avails[0];
+            }
+
+            if (has_custom_split && active_dev_weight_sum > 0.0) {
+                for (size_t idx = 0; idx < dev_avails.size() && idx < 128; ++idx) {
+                    double w = static_cast<double>(mparams.tensor_split[idx]);
+                    if (w > 0.0) {
+                        double ratio = w / active_dev_weight_sum;
+                        uint64_t dev_cap = static_cast<uint64_t>(static_cast<double>(dev_avails[idx]) / ratio);
+                        split_bounded_usable = std::min<uint64_t>(split_bounded_usable, dev_cap);
+                        usable_sum += dev_avails[idx];
+                    }
+                }
+                return std::min<uint64_t>(usable_sum, split_bounded_usable);
+            }
+
+            for (uint64_t a : dev_avails) {
+                usable_sum += a;
+            }
+            return usable_sum;
+        };
+
+        const bool auto_layers = (mparams.n_gpu_layers < 0 || mparams.n_gpu_layers >= 999);
+
+        auto compute_target_gpu_layers = [&](uint64_t usable_vram) -> int32_t {
+            if (mparams.n_gpu_layers == 0 || actual_layers <= 0 || usable_vram == 0) {
+                return 0;
+            }
+
+            uint64_t embd_bytes = 0;
+            if (total_params > 0 && n_vocab > 0 && n_embd > 0) {
+                double bytes_per_param = static_cast<double>(effective_model_bytes) / static_cast<double>(total_params);
+                uint64_t est_embd = static_cast<uint64_t>(static_cast<double>(n_vocab) * static_cast<double>(n_embd) * bytes_per_param);
+                embd_bytes = std::min<uint64_t>(effective_model_bytes / 4, est_embd);
+            }
+
+            const uint64_t repeating_layer_bytes = (effective_model_bytes > embd_bytes)
+                                                       ? (effective_model_bytes - embd_bytes)
+                                                       : effective_model_bytes;
+            const uint64_t bytes_per_layer = std::max<uint64_t>(1, repeating_layer_bytes / static_cast<uint64_t>(actual_layers));
+
+            int32_t max_fit_layers = 0;
+            if (usable_vram >= effective_model_bytes) {
+                max_fit_layers = actual_layers + 1;
+            } else if (usable_vram >= bytes_per_layer) {
+                max_fit_layers = static_cast<int32_t>(std::min<uint64_t>(static_cast<uint64_t>(actual_layers), usable_vram / bytes_per_layer));
+            }
+
+            return auto_layers ? max_fit_layers : std::min<int32_t>(mparams.n_gpu_layers, max_fit_layers);
+        };
+
+        auto build_model_and_context = [&](const char* load_path,
+                                           const infer_model_params& lp,
+                                           int32_t gpu_layers,
+                                           std::unique_ptr<llama_model, decltype(&llama_model_free)> reusable_cpu_model,
+                                           std::unique_ptr<llama_model, decltype(&llama_model_free)>& out_model,
+                                           std::unique_ptr<llama_context, decltype(&llama_free)>& out_lctx,
+                                           UniqueSampler& out_sampler,
+                                           struct llama_sampler*& out_pen,
+                                           uint32_t& out_n_ctx,
+                                           std::string& err_msg) -> bool {
+            bool lp_has_split = false;
+            for (size_t i = 0; i < 128; ++i) {
+                if (lp.tensor_split[i] > 0.0f) {
+                    lp_has_split = true;
+                    break;
+                }
+            }
+
+            struct llama_model_params llama_mparams = llama_model_default_params();
+            llama_mparams.n_gpu_layers = gpu_layers;
+            llama_mparams.main_gpu     = lp.main_gpu;
+            llama_mparams.split_mode   = static_cast<enum llama_split_mode>(lp.split_mode);
+            llama_mparams.tensor_split = lp_has_split ? lp.tensor_split : nullptr;
+            apply_model_load_params(llama_mparams, lp.use_mmap, lp.use_mlock);
+
+            if (reusable_cpu_model && gpu_layers == 0 && lp.use_mmap && !lp.use_mlock) {
+                out_model = std::move(reusable_cpu_model);
+            } else {
+                reusable_cpu_model.reset();
+                out_model.reset(llama_model_load_from_file(load_path, llama_mparams));
+            }
+
+            if (!out_model) {
+                err_msg = "Failed to load model from path: " + std::string(load_path);
+                return false;
+            }
+
+            const enum ggml_type tk = map_kv_type(lp.kv_type_k);
+            const enum ggml_type tv = map_kv_type(lp.kv_type_v);
+
+            uint32_t safe_ctx = calculate_safe_n_ctx(
+                out_model.get(), lp.requested_ctx, llama_mparams.n_gpu_layers, tk, tv);
+
+            if (lp.requested_ctx > 0 && safe_ctx < lp.requested_ctx && !lp.allow_ctx_reduction) {
+                err_msg = "Requested context size (" + std::to_string(lp.requested_ctx) +
+                          ") exceeds model training length or available memory budget (" +
+                          std::to_string(safe_ctx) + ").";
+                return false;
+            }
+
+            if (safe_ctx < 256) {
+                err_msg = "Context size too small (minimum 256).";
+                return false;
+            }
+
+            
+			
+			const int32_t model_layers  = llama_model_n_layer(out_model.get());
+            const bool has_gpu          = (llama_mparams.n_gpu_layers != 0) && infer_has_real_gpu();
+            const bool full_gpu_offload = has_gpu && (model_layers > 0) && (llama_mparams.n_gpu_layers >= model_layers);
+            const int32_t threads_gen   = pick_threads(full_gpu_offload, false);
+            const int32_t threads_batch = pick_threads(full_gpu_offload, true);
+
+            uint32_t candidate_ctx = safe_ctx;
+            while (candidate_ctx >= 256) {
+                struct llama_context_params ctx_params = llama_context_default_params();
+                ctx_params.n_ctx           = candidate_ctx;
+                ctx_params.n_batch         = std::min<uint32_t>(candidate_ctx, DEFAULT_BATCH_CAP);
+                ctx_params.n_seq_max       = 1;
+                ctx_params.kv_unified      = true;
+                ctx_params.type_k          = tk;
+                ctx_params.type_v          = tv;
+                ctx_params.n_threads       = threads_gen;
+                ctx_params.n_threads_batch = threads_batch;
+                apply_flash_attn_param(ctx_params, lp.flash_attn);
+
+                out_lctx.reset(llama_init_from_model(out_model.get(), ctx_params));
+                if (out_lctx) {
+                    break;
+                }
+                if (lp.requested_ctx > 0 && !lp.allow_ctx_reduction) {
+                    break;
+                }
+                if (candidate_ctx == 256) {
+                    break;
+                }
+                candidate_ctx = std::max<uint32_t>(256, candidate_ctx / 2);
+            }
+
+            if (!out_lctx) {
+                err_msg = "Failed to initialize llama_context for requested context size.";
+                return false;
+            }
+
+            llama_set_abort_callback(out_lctx.get(), internal_abort_cb, ctx);
+			
+			
+			
+
+            out_n_ctx = llama_n_ctx_seq(out_lctx.get());
+            if (lp.requested_ctx > 0 && out_n_ctx < lp.requested_ctx && !lp.allow_ctx_reduction) {
+                err_msg = "Allocated context size (" + std::to_string(out_n_ctx) +
+                          ") is smaller than explicitly requested size (" +
+                          std::to_string(lp.requested_ctx) + ").";
+                return false;
+            }
+
+            out_pen = nullptr;
+            out_sampler = create_sampler(
+                ctx->sampler_params, out_model.get(), out_n_ctx, ctx->grammar_gbnf, err_msg, &out_pen);
+            if (!out_sampler) {
+                return false;
+            }
+
+            return true;
+        };
+
+        std::unique_ptr<llama_model, decltype(&llama_model_free)> new_model(nullptr, &llama_model_free);
         std::unique_ptr<llama_context, decltype(&llama_free)> new_lctx(nullptr, &llama_free);
-        uint32_t candidate_ctx = safe_ctx;
-
-        while (candidate_ctx >= 256) {
-            struct llama_context_params ctx_params = llama_context_default_params();
-            ctx_params.n_ctx           = candidate_ctx;
-            ctx_params.n_batch         = std::min<uint32_t>(candidate_ctx, DEFAULT_BATCH_CAP);
-            ctx_params.n_seq_max       = 1;
-            ctx_params.kv_unified      = true;
-            ctx_params.type_k          = type_k;
-            ctx_params.type_v          = type_v;
-            ctx_params.n_threads       = threads_gen;
-            ctx_params.n_threads_batch = threads_batch;
-            apply_flash_attn_param(ctx_params, mparams.flash_attn);
-
-            new_lctx.reset(llama_init_from_model(new_model.get(), ctx_params));
-            if (new_lctx) {
-                break;
-            }
-
-            if (mparams.requested_ctx > 0 && !mparams.allow_ctx_reduction) {
-                break;
-            }
-            if (candidate_ctx == 256) {
-                break;
-            }
-            candidate_ctx = std::max<uint32_t>(256, candidate_ctx / 2);
-        }
-
-        if (!new_lctx) {
-            ctx->set_error("Failed to initialize llama_context for requested context size.");
-            return false;
-        }
-
-        const uint32_t new_n_ctx = llama_n_ctx_seq(new_lctx.get());
-        if (mparams.requested_ctx > 0 && new_n_ctx < mparams.requested_ctx && !mparams.allow_ctx_reduction) {
-            ctx->set_error("Allocated context size (" + std::to_string(new_n_ctx) +
-                           ") is smaller than explicitly requested size (" +
-                           std::to_string(mparams.requested_ctx) + ").");
-            return false;
-        }
-
-        std::string err;
+        UniqueSampler new_sampler(nullptr, &llama_sampler_free);
         struct llama_sampler* new_pen = nullptr;
-        UniqueSampler new_sampler = create_sampler(
-            ctx->sampler_params, new_model.get(), new_n_ctx, ctx->grammar_gbnf, err, &new_pen);
-        if (!new_sampler) {
-            ctx->set_error(err);
+        uint32_t new_n_ctx = 0;
+        std::string load_err;
+
+        const bool had_old_model = (ctx->model != nullptr);
+        const std::string backup_path = ctx->loaded_model_path;
+        const infer_model_params backup_params = ctx->loaded_model_params;
+        const int32_t backup_gpu_layers = ctx->loaded_gpu_layers;
+        const std::string backup_chat_tmpl = ctx->custom_chat_template;
+
+        uint64_t current_usable_vram = query_usable_vram();
+        int32_t target_gpu_layers = compute_target_gpu_layers(current_usable_vram);
+
+        bool needs_teardown_for_vram = had_old_model && (mparams.n_gpu_layers != 0) &&
+                                       (current_usable_vram < effective_model_bytes);
+
+        bool loaded_ok = false;
+        if (!needs_teardown_for_vram) {
+            loaded_ok = build_model_and_context(
+                path, mparams, target_gpu_layers, std::move(probe_model),
+                new_model, new_lctx, new_sampler, new_pen, new_n_ctx, load_err);
+        }
+
+        if (!loaded_ok && had_old_model) {
+            probe_model.reset();
+            new_sampler.reset();
+            new_lctx.reset();
+            new_model.reset();
+
+            free_model_resources_locked(ctx);
+
+            current_usable_vram = query_usable_vram();
+            target_gpu_layers = compute_target_gpu_layers(current_usable_vram);
+
+            std::unique_ptr<llama_model, decltype(&llama_model_free)> empty_probe(nullptr, &llama_model_free);
+            loaded_ok = build_model_and_context(
+                path, mparams, target_gpu_layers, std::move(empty_probe),
+                new_model, new_lctx, new_sampler, new_pen, new_n_ctx, load_err);
+
+            if (!loaded_ok && !backup_path.empty()) {
+                std::unique_ptr<llama_model, decltype(&llama_model_free)> r_model(nullptr, &llama_model_free);
+                std::unique_ptr<llama_context, decltype(&llama_free)> r_lctx(nullptr, &llama_free);
+                UniqueSampler r_sampler(nullptr, &llama_sampler_free);
+                struct llama_sampler* r_pen = nullptr;
+                uint32_t r_n_ctx = 0;
+                std::string restore_err;
+                std::unique_ptr<llama_model, decltype(&llama_model_free)> empty_restore_probe(nullptr, &llama_model_free);
+
+                if (build_model_and_context(
+                        backup_path.c_str(), backup_params, backup_gpu_layers, std::move(empty_restore_probe),
+                        r_model, r_lctx, r_sampler, r_pen, r_n_ctx, restore_err)) {
+                    auto r_specials = collect_special_texts(llama_model_get_vocab(r_model.get()));
+                    SpecialTokenLookup r_lookup;
+                    r_lookup.build(r_specials);
+                    ctx->model                = r_model.release();
+                    ctx->lctx                 = r_lctx.release();
+                    ctx->sampler              = r_sampler.release();
+                    ctx->penalty_smpl         = r_pen;
+                    ctx->special_lookup       = std::move(r_lookup);
+                    ctx->model_fingerprint    = compute_model_fingerprint(ctx->model);
+                    ctx->n_ctx                = r_n_ctx;
+                    ctx->loaded_model_path    = backup_path;
+                    ctx->loaded_model_params  = backup_params;
+                    ctx->loaded_gpu_layers    = backup_gpu_layers;
+                    ctx->custom_chat_template = backup_chat_tmpl;
+                }
+            }
+        }
+
+        if (!loaded_ok) {
+            ctx->set_error(load_err);
             return false;
         }
 
         auto specials = collect_special_texts(llama_model_get_vocab(new_model.get()));
         SpecialTokenLookup new_lookup;
         new_lookup.build(specials);
-
         const uint64_t new_fingerprint = compute_model_fingerprint(new_model.get());
 
-        ctx->model             = new_model.release();
-        ctx->lctx              = new_lctx.release();
-        ctx->sampler           = new_sampler.release();
-        ctx->penalty_smpl      = new_pen;
-        ctx->special_lookup    = std::move(new_lookup);
-        ctx->model_fingerprint = new_fingerprint;
-        ctx->n_ctx             = new_n_ctx;
+        free_model_resources_locked(ctx);
+
+        ctx->model               = new_model.release();
+        ctx->lctx                = new_lctx.release();
+        ctx->sampler             = new_sampler.release();
+        ctx->penalty_smpl        = new_pen;
+        ctx->special_lookup      = std::move(new_lookup);
+        ctx->model_fingerprint   = new_fingerprint;
+        ctx->n_ctx               = new_n_ctx;
         ctx->n_past.store(0, std::memory_order_relaxed);
-        ctx->n_keep            = 0;
+        ctx->n_keep              = 0;
+        ctx->loaded_model_path   = path;
+        ctx->loaded_model_params = mparams;
+        ctx->loaded_model_params.chat_template = nullptr;
+        ctx->loaded_gpu_layers   = target_gpu_layers;
         if (mparams.chat_template) {
             ctx->custom_chat_template = mparams.chat_template;
+        } else {
+            ctx->custom_chat_template = backup_chat_tmpl;
         }
 
         return true;
@@ -2293,6 +2637,9 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
         return false;
     }
 }
+
+
+
 
 bool infer_load_model(infer_ctx* ctx, const char* path, uint32_t requested_ctx) {
     infer_model_params params = infer_model_default_params();
@@ -2367,8 +2714,11 @@ bool infer_set_chat_template(infer_ctx* ctx, const char* custom_template) {
     }
 }
 
-bool infer_get_model_info(infer_ctx* ctx, infer_model_info* out_info) {
-    if (!ctx || !out_info) return false;
+
+ 
+ 
+ bool infer_get_model_info(infer_ctx* ctx, infer_model_info* out_info) {
+    if (!ctx || !out_info || ctx->shutting_down.load(std::memory_order_acquire)) return false;
     if (out_info->struct_size == 0) {
         ctx->set_error("Invalid infer_model_info struct_size (must be non-zero).");
         return false;
@@ -2422,7 +2772,7 @@ bool infer_last_success(infer_ctx* ctx) {
 }
 
 int32_t infer_tokenize_count(infer_ctx* ctx, const char* text, bool add_special) {
-    if (!ctx || !text) return -1;
+    if (!ctx || !text || ctx->shutting_down.load(std::memory_order_acquire)) return -1;
 
     try {
         std::lock_guard<std::mutex> lock(ctx->ctx_mutex);
@@ -2440,6 +2790,8 @@ int32_t infer_tokenize_count(infer_ctx* ctx, const char* text, bool add_special)
         return -1;
     }
 }
+
+  
 
 uint32_t infer_get_kv_cache_token_count(infer_ctx* ctx) {
     if (!ctx) return 0;
@@ -2886,8 +3238,10 @@ bool infer_state_load(infer_ctx* ctx, const char* filepath) {
     }
 }
 
+
+
 int32_t infer_get_embedding_dim(infer_ctx* ctx) {
-    if (!ctx) return 0;
+    if (!ctx || ctx->shutting_down.load(std::memory_order_acquire)) return 0;
     try {
         std::lock_guard<std::mutex> lock(ctx->ctx_mutex);
         return ctx->model ? llama_model_n_embd(ctx->model) : 0;
@@ -2895,6 +3249,7 @@ int32_t infer_get_embedding_dim(infer_ctx* ctx) {
         return 0;
     }
 }
+ 
 
 bool infer_get_embeddings_ex(infer_ctx* ctx, const char* text, float* out_vec, size_t vec_len, bool normalize) {
     if (!ctx) return false;
@@ -2965,12 +3320,31 @@ bool infer_get_embeddings_ex(infer_ctx* ctx, const char* text, float* out_vec, s
             }
         } embd_guard{ctx};
 
+ 
+ 
+ if (effective_batch_cap <= 0) {
+            ctx->set_error("Invalid effective batch capacity.");
+            return false;
+        }
+
         struct llama_batch batch = llama_batch_init(effective_batch_cap, 0, 1);
         struct BatchGuard {
             struct llama_batch& b;
             ~BatchGuard() { llama_batch_free(b); }
         } guard{batch};
 
+        if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+            ctx->set_error("Failed to allocate llama_batch internal buffers for embeddings.");
+            return false;
+        }
+        for (int k = 0; k < effective_batch_cap; ++k) {
+            if (!batch.seq_id[k]) {
+                ctx->set_error("Failed to allocate llama_batch sequence ID array for embeddings.");
+                return false;
+            }
+        }
+		
+		
         for (size_t i = 0; i < tokens.size(); ) {
             if (ctx->abort_flag.load(std::memory_order_relaxed)) {
                 ctx->set_error("Embedding generation aborted.");
@@ -3048,7 +3422,7 @@ bool infer_is_generating(infer_ctx* ctx) {
 }
 
 void infer_wait(infer_ctx* ctx) {
-    if (!ctx) return;
+    if (!ctx || ctx->shutting_down.load(std::memory_order_acquire)) return;
     if (std::this_thread::get_id() == ctx->active_gen_thread_id.load(std::memory_order_acquire)) {
         ctx->set_error("Cannot call infer_wait from inside an active generation callback.");
         return;
@@ -3057,13 +3431,16 @@ void infer_wait(infer_ctx* ctx) {
     try {
         std::unique_lock<std::mutex> lk(ctx->gen_mutex);
         ctx->cv_generating.wait(lk, [ctx]() {
-            return !ctx->is_generating.load(std::memory_order_acquire);
+            return !ctx->is_generating.load(std::memory_order_acquire) ||
+                   ctx->shutting_down.load(std::memory_order_acquire);
         });
     } catch (...) {}
 
+    if (ctx->shutting_down.load(std::memory_order_acquire)) return;
+
     try {
         std::lock_guard<std::mutex> lock(ctx->worker_mutex);
-        if (ctx->async_worker.joinable()) {
+        if (!ctx->shutting_down.load(std::memory_order_acquire) && ctx->async_worker.joinable()) {
             ctx->async_worker.join();
         }
     } catch (...) {}
@@ -3132,11 +3509,21 @@ bool infer_generate_chat_async_v2(
     void* user_data
 ) {
     if (!ctx || !msgs || num_msgs == 0 || !callback) return false;
+    if (ctx->shutting_down.load(std::memory_order_acquire)) {
+        ctx->set_error("Context is shutting down.");
+        return false;
+    }
     if (!validate_chat_messages(ctx, msgs, num_msgs)) return false;
 
     bool expected = false;
     if (!ctx->is_generating.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         ctx->set_error("Inference context is currently busy.");
+        return false;
+    }
+
+    if (ctx->shutting_down.load(std::memory_order_acquire)) {
+        release_gen(ctx);
+        ctx->set_error("Context is shutting down.");
         return false;
     }
 
@@ -3159,34 +3546,47 @@ bool infer_generate_chat_async_v2(
             ctx->async_worker.join();
         }
 
+        if (ctx->shutting_down.load(std::memory_order_acquire)) {
+            release_gen(ctx);
+            ctx->set_error("Context is shutting down.");
+            return false;
+        }
+
         ctx->abort_flag.store(false, std::memory_order_release);
         ctx->clear_error();
         const bool prev_success = ctx->last_success.load(std::memory_order_acquire);
         ctx->last_success.store(false, std::memory_order_release);
 
         try {
-            ctx->async_worker = std::thread([ctx, owned_msgs = std::move(owned), max_tokens, callback, user_data]() {
-                ctx->active_gen_thread_id.store(std::this_thread::get_id(), std::memory_order_release);
+            ctx->async_worker = std::thread([ctx, owned_msgs = std::move(owned), max_tokens, callback, user_data]() noexcept {
                 struct WorkerFlagGuard {
                     infer_ctx* c;
-                    ~WorkerFlagGuard() { release_gen(c); }
+                    ~WorkerFlagGuard() noexcept { release_gen(c); }
                 } flag_guard{ctx};
 
-                std::vector<infer_chat_msg> view(owned_msgs.size());
-                for (size_t i = 0; i < owned_msgs.size(); ++i) {
-                    view[i].role    = owned_msgs[i].role.c_str();
-                    view[i].content = owned_msgs[i].content.c_str();
-                }
-
                 try {
+                    ctx->active_gen_thread_id.store(std::this_thread::get_id(), std::memory_order_release);
+
+                    if (ctx->shutting_down.load(std::memory_order_acquire)) {
+                        ctx->last_success.store(false, std::memory_order_release);
+                        ctx->set_error("Generation aborted due to context shutdown.");
+                        return;
+                    }
+
+                    std::vector<infer_chat_msg> view(owned_msgs.size());
+                    for (size_t i = 0; i < owned_msgs.size(); ++i) {
+                        view[i].role    = owned_msgs[i].role.c_str();
+                        view[i].content = owned_msgs[i].content.c_str();
+                    }
+
                     bool res = infer_generate_chat_internal(ctx, view.data(), view.size(), max_tokens, callback, user_data);
                     ctx->last_success.store(res, std::memory_order_release);
                 } catch (const std::exception& e) {
                     ctx->last_success.store(false, std::memory_order_release);
-                    ctx->set_error(e.what());
+                    try { ctx->set_error(e.what()); } catch (...) {}
                 } catch (...) {
                     ctx->last_success.store(false, std::memory_order_release);
-                    ctx->set_error("Unknown exception during async chat generation.");
+                    try { ctx->set_error("Unknown exception during async chat generation."); } catch (...) {}
                 }
             });
         } catch (...) {
@@ -3196,15 +3596,17 @@ bool infer_generate_chat_async_v2(
 
         return true;
     } catch (const std::exception& e) {
-        ctx->set_error(e.what());
+        try { ctx->set_error(e.what()); } catch (...) {}
         release_gen(ctx);
         return false;
     } catch (...) {
-        ctx->set_error("Unknown exception launching async thread.");
+        try { ctx->set_error("Unknown exception launching async thread."); } catch (...) {}
         release_gen(ctx);
         return false;
     }
 }
+
+
 
 bool infer_generate_chat_async(
     infer_ctx* ctx,
@@ -3215,11 +3617,21 @@ bool infer_generate_chat_async(
     void* user_data
 ) {
     if (!ctx || !msgs || num_msgs == 0 || !callback) return false;
+    if (ctx->shutting_down.load(std::memory_order_acquire)) {
+        ctx->set_error("Context is shutting down.");
+        return false;
+    }
     if (!validate_chat_messages(ctx, msgs, num_msgs)) return false;
 
     bool expected = false;
     if (!ctx->is_generating.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         ctx->set_error("Inference context is currently busy.");
+        return false;
+    }
+
+    if (ctx->shutting_down.load(std::memory_order_acquire)) {
+        release_gen(ctx);
+        ctx->set_error("Context is shutting down.");
         return false;
     }
 
@@ -3242,35 +3654,48 @@ bool infer_generate_chat_async(
             ctx->async_worker.join();
         }
 
+        if (ctx->shutting_down.load(std::memory_order_acquire)) {
+            release_gen(ctx);
+            ctx->set_error("Context is shutting down.");
+            return false;
+        }
+
         ctx->abort_flag.store(false, std::memory_order_release);
         ctx->clear_error();
         const bool prev_success = ctx->last_success.load(std::memory_order_acquire);
         ctx->last_success.store(false, std::memory_order_release);
 
         try {
-            ctx->async_worker = std::thread([ctx, owned_msgs = std::move(owned), max_tokens, callback, user_data]() {
-                ctx->active_gen_thread_id.store(std::this_thread::get_id(), std::memory_order_release);
+            ctx->async_worker = std::thread([ctx, owned_msgs = std::move(owned), max_tokens, callback, user_data]() noexcept {
                 struct WorkerFlagGuard {
                     infer_ctx* c;
-                    ~WorkerFlagGuard() { release_gen(c); }
+                    ~WorkerFlagGuard() noexcept { release_gen(c); }
                 } flag_guard{ctx};
 
-                std::vector<infer_chat_msg> view(owned_msgs.size());
-                for (size_t i = 0; i < owned_msgs.size(); ++i) {
-                    view[i].role    = owned_msgs[i].role.c_str();
-                    view[i].content = owned_msgs[i].content.c_str();
-                }
-
-                V1StreamThunk thunk{callback, user_data};
                 try {
+                    ctx->active_gen_thread_id.store(std::this_thread::get_id(), std::memory_order_release);
+
+                    if (ctx->shutting_down.load(std::memory_order_acquire)) {
+                        ctx->last_success.store(false, std::memory_order_release);
+                        ctx->set_error("Generation aborted due to context shutdown.");
+                        return;
+                    }
+
+                    std::vector<infer_chat_msg> view(owned_msgs.size());
+                    for (size_t i = 0; i < owned_msgs.size(); ++i) {
+                        view[i].role    = owned_msgs[i].role.c_str();
+                        view[i].content = owned_msgs[i].content.c_str();
+                    }
+
+                    V1StreamThunk thunk{callback, user_data};
                     bool res = infer_generate_chat_internal(ctx, view.data(), view.size(), max_tokens, v1_stream_adapter, &thunk);
                     ctx->last_success.store(res, std::memory_order_release);
                 } catch (const std::exception& e) {
                     ctx->last_success.store(false, std::memory_order_release);
-                    ctx->set_error(e.what());
+                    try { ctx->set_error(e.what()); } catch (...) {}
                 } catch (...) {
                     ctx->last_success.store(false, std::memory_order_release);
-                    ctx->set_error("Unknown exception during async chat generation.");
+                    try { ctx->set_error("Unknown exception during async chat generation."); } catch (...) {}
                 }
             });
         } catch (...) {
@@ -3280,15 +3705,18 @@ bool infer_generate_chat_async(
 
         return true;
     } catch (const std::exception& e) {
-        ctx->set_error(e.what());
+        try { ctx->set_error(e.what()); } catch (...) {}
         release_gen(ctx);
         return false;
     } catch (...) {
-        ctx->set_error("Unknown exception launching async thread.");
+        try { ctx->set_error("Unknown exception launching async thread."); } catch (...) {}
         release_gen(ctx);
         return false;
     }
 }
+
+
+
 
 bool infer_generate_chat_turn_v2(
     infer_ctx* ctx,
@@ -3531,15 +3959,22 @@ bool infer_generate_completion(
 void infer_free(infer_ctx* ctx) {
     if (!ctx) return;
 
-    ctx->abort_flag.store(true, std::memory_order_release);
-
     if (std::this_thread::get_id() == ctx->active_gen_thread_id.load(std::memory_order_acquire)) {
+        ctx->abort_flag.store(true, std::memory_order_release);
         ctx->set_error("Cannot call infer_free from inside an active generation callback.");
         return;
     }
 
+    bool expected_shutdown = false;
+    if (!ctx->shutting_down.compare_exchange_strong(expected_shutdown, true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    ctx->abort_flag.store(true, std::memory_order_release);
+
     try {
         std::unique_lock<std::mutex> lk(ctx->gen_mutex);
+        ctx->cv_generating.notify_all();
         ctx->cv_generating.wait(lk, [ctx]() {
             return !ctx->is_generating.load(std::memory_order_acquire);
         });
@@ -3550,6 +3985,13 @@ void infer_free(infer_ctx* ctx) {
         if (ctx->async_worker.joinable()) {
             ctx->async_worker.join();
         }
+    } catch (...) {}
+
+    try {
+        std::unique_lock<std::mutex> lk(ctx->gen_mutex);
+        ctx->cv_generating.wait(lk, [ctx]() {
+            return !ctx->is_generating.load(std::memory_order_acquire);
+        });
     } catch (...) {}
 
     try {

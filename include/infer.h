@@ -158,6 +158,9 @@ typedef struct infer_model_params {
     int32_t     kv_type_v;           /**< Value cache quantization (`infer_kv_type`, default: `INFER_KV_TYPE_F16`) */
     bool        allow_ctx_reduction; /**< If `true`, allows shrinking an explicit `requested_ctx` on OOM */
     const char* chat_template;       /**< Optional custom Jinja/named chat template override (`NULL` = model default) */
+    float       tensor_split[128];   /**< Multi-GPU tensor split proportions (all `0.0f` = default) */
+    int32_t     main_gpu;            /**< Primary GPU index (default: `0`) */
+    int32_t     split_mode;          /**< Multi-GPU split mode (`0` = none, `1` = layer, `2` = row; default: `1`) */
 } infer_model_params;
 
 /** Single chat message entry. */
