@@ -23,253 +23,209 @@ It exposes a simple C ABI interface (`infer.h`), making it easy to embed real-ti
 
 ---
 
-## 🌟 Key Features
+ # libinfer
 
-* 🔌 **Clean C ABI Boundary (`infer.h`):** Simple C-compatible API for easy integration into any language.
-* ⚡ **Streaming Token Callbacks:** Real-time token output streaming with early abort control.
-* 🔄 **Async & Non-Blocking Generation:** Background thread worker dispatch (`infer_generate_chat_async`).
-* 🧠 **Smart Memory & VRAM Clamping:** Automatically queries hardware VRAM to safe-clamp token context size (`n_ctx`).
-* ⚙️ **Dynamic Backend Loading:** Dynamic load support for `ggml-cuda` dynamic modules on hardware accelerators.
-* 📦 **vcpkg & Submodule Ready:** Native support for both `vcpkg.json` manifest mode and CMake submodules.
+**libinfer** is a production-ready, thread-safe C/C++ inference API wrapper around `llama.cpp`. It is designed to provide a robust, easy-to-use interface for managing model lifecycles, chat generation, text completion, state persistence, and embedding extraction with automatic GPU/CPU scaling.
 
----
+## Features
+* **Thread-Safe**: Safely call abort, wait, and state checks from any thread.
+* **Auto GPU/CPU Scaling**: Automatically detects system RAM/VRAM and distributes layers dynamically.
+* **State Persistence**: Save and load KV cache and chat history to disk with CRC32 verification.
+* **Async Generation**: Built-in background worker thread for non-blocking UI integration.
+* **Streaming Callbacks**: Real-time token streaming with safe abortion hooks.
+* **Advanced Sampling**: Full support for Top-K, Top-P, Min-P, GBNF grammars, and repetition penalties.
 
-## 🏛️ Shared Libraries & DLL Structure
+## Build and Install
 
-When you build or download `libinfer`, the compilation produces standard platform dynamic libraries:
+This project uses CMake and optionally vcpkg.
 
-| Platform | Runtime Dynamic Library | Import Library (Compile-time) | Backend Modules (Optional) |
-| :--- | :--- | :--- | :--- |
-| **Windows** | `infer.dll` | `infer.lib` *(Required for MSVC)* | `ggml-cuda.dll` |
-| **Linux** | `libinfer.so` | *(Linked directly to `libinfer.so`)* | `ggml-cuda.so` |
-| **macOS** | `libinfer.dylib` | *(Linked directly to `libinfer.dylib`)* | Metal backend built-in |
+```bash
+# Clone with submodules (required for llama.cpp)
+git clone --recursive https://github.com/codeboxqc/libinfer.git
+cd libinfer
 
-> **Important for Windows Users:**  
-> When compiling applications against `infer.dll` using MSVC, you **must** link against `infer.lib` at compile time and keep `infer.dll` alongside your compiled executable at runtime.
-
----
-
-## 📦 Compatible GGUF Models
-
-`libinfer` supports all GGUF model architectures supported by `llama.cpp` (e.g. Llama 3, Qwen 2.5, DeepSeek R1, Phi-3, Mistral).
-
-### Recommended Download Links
-
-| Model | Model File | Size / VRAM | Download Link |
-| :--- | :--- | :--- | :--- |
-| **Qwen 2.5 Coder 7B** *(Coding)* | `qwen2.5-coder-7b-instruct-q4_k_m.gguf` | ~4.7 GB | [HuggingFace Link](https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/blob/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf) |
-| **Llama 3.2 3B** *(Lightweight)* | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | ~2.0 GB | [HuggingFace Link](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF) |
-| **Llama 3.1 8B** *(General)* | `Llama-3.1-8B-Instruct-Q4_K_M.gguf` | ~4.9 GB | [HuggingFace Link](https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF) |
-| **DeepSeek R1 Distill Qwen 7B** *(Reasoning)* | `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` | ~4.7 GB | [HuggingFace Link](https://huggingface.co/unsloth/DeepSeek-R1-Distill-Qwen-7B-GGUF) |
-| **Phi 3.5 Mini** *(Mobile/Fast)* | `Phi-3.5-mini-instruct-Q4_K_M.gguf` | ~2.4 GB | [HuggingFace Link](https://huggingface.co/bartowski/Phi-3.5-mini-instruct-GGUF) |
-
-* **Recommended Quantization Types:** `Q4_K_M` (Best balance of speed and memory), `Q5_K_M`, `Q8_0` (Highest accuracy).
-* 🔍 **Browse all GGUF models on Hugging Face:** [HuggingFace GGUF Models](https://huggingface.co/models?library=gguf)
+# Build
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . --config Release
+```
 
 ---
 
+## API Reference (Wiki)
 
-<img width="709" height="301" alt="2" src="https://github.com/user-attachments/assets/37afa1bb-3d0f-451d-a063-f79921a6e72b" />
+Here is a detailed breakdown of all functions available in `infer.h`. 
 
-you 9 dll next to your exe!
-<img width="537" height="476" alt="Untitled" src="https://github.com/user-attachments/assets/efe17356-e195-4512-8da3-ddc4e4d34908" />
+### Initialization & Lifecycle
+* `infer_init()` / `infer_init_ex()`: Initializes the backend and allocates a new inference context (`infer_ctx`).
+* `infer_free(infer_ctx* ctx)`: Safely aborts any running generation, clears memory, and destroys the context.
+* `infer_version()`: Returns the compiled version integer.
 
+### Model Management
+* `infer_load_model(infer_ctx* ctx, const char* path, uint32_t requested_ctx)`: Loads a `.gguf` model using default auto-scaling parameters.
+* `infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_params* params)`: Loads a model with explicit GPU offload, mmap, mlock, and Flash Attention settings.
+* `infer_unload_model(infer_ctx* ctx)`: Unloads the active model and releases VRAM/RAM without destroying the context.
+* `infer_get_model_info(infer_ctx* ctx, infer_model_info* out_info)`: Retrieves model metadata (layers, dimensions, active context).
 
+### Configuration
+* `infer_set_sampler(infer_ctx* ctx, const infer_sampler_params* params)`: Updates the sampler chain (temperature, top-p, min-p, etc.).
+* `infer_set_chat_template(infer_ctx* ctx, const char* custom_template)`: Overrides the built-in Jinja chat template.
+* `infer_set_stop_sequences(infer_ctx* ctx, const char* const* stop_words, size_t num_words)`: Configures custom stop words.
+* `infer_set_grammar(infer_ctx* ctx, const char* grammar_gbnf)`: Constrains output using a GBNF grammar string.
+* `infer_set_log_callback(infer_log_cb callback, void* user_data)`: Hooks into the backend logging system.
 
-## 🚀 Quick Start Guide
+### Generation & Chat
+* `infer_generate_chat(...)` / `infer_generate_chat_v2(...)`: Synchronous chat generation over an array of messages.
+* `infer_generate_chat_async(...)` / `infer_generate_chat_async_v2(...)`: Non-blocking chat generation on a background thread.
+* `infer_generate_chat_turn(...)` / `infer_generate_chat_turn_v2(...)`: Appends a single turn to the ongoing history, reusing the KV cache prefix automatically.
+* `infer_generate_completion(...)` / `infer_generate_completion_v2(...)`: Raw text completion without chat templates.
 
-### Step 1: Get the Pre-Built Binaries
-Download pre-compiled binaries for your operating system directly from **[GitHub Releases](https://github.com/codeboxqc/libinfer/releases)**:
-* `libinfer-windows-x64.zip`
-* `libinfer-linux-x64.zip`
-* `libinfer-macos-arm64.zip`
+### State & Memory Management
+* `infer_memory_clear(infer_ctx* ctx)`: Clears the KV cache and empties the stored chat history.
+* `infer_state_save(infer_ctx* ctx, const char* filepath)`: Atomically saves KV cache and chat history to disk.
+* `infer_state_load(infer_ctx* ctx, const char* filepath)`: Restores KV cache and chat history from disk.
+* `infer_get_kv_cache_token_count(infer_ctx* ctx)`: Returns the number of active tokens in the KV cache.
+
+### Embeddings
+* `infer_get_embeddings(infer_ctx* ctx, const char* text, float* out_vec, size_t vec_len)`: Computes raw unnormalized embeddings.
+* `infer_get_embeddings_ex(...)`: Computes embeddings with optional L2 normalization.
+* `infer_get_embedding_dim(infer_ctx* ctx)`: Returns the embedding dimension (`n_embd`) of the loaded model.
+
+### Concurrency & Synchronization
+* `infer_abort(infer_ctx* ctx)`: Asynchronously halts any in-flight generation.
+* `infer_wait(infer_ctx* ctx)`: Blocks until active async generation completes.
+* `infer_is_generating(infer_ctx* ctx)`: Returns `true` if the context is currently busy.
+* `infer_last_success(infer_ctx* ctx)`: Returns `true` if the last generation/embedding task completed without errors.
+* `infer_get_last_error(infer_ctx* ctx, char* out_buf, size_t buf_size)`: Retrieves the last error message string.
 
 ---
 
-### Step 2: Write Your Application (`main.c`)
+## Minimal Examples
 
-Create a file named `main.c`:
+### 1. Initializing and Loading a Model
 
+This example demonstrates how to spin up a context and load a model with an automatic context size (passing `0` allows it to auto-size based on free RAM/VRAM).
 
-IF it slow you need bigger NVEDIA
-you canuse any ai model .gguf   
-This example is using qwen2.5-coder-7b-instruct-q4_k_m.gguf
-https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/blob/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf
-
-```c
+ c
 #include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <string.h>
-
 #include "infer.h"
 
-// Automatically link infer.lib when compiling with MSVC on Windows
-#if defined(_WIN32) && defined(_MSC_VER)
-#pragma comment(lib, "infer.lib")
-#endif
-
-// 1. Streaming Callback: Prints generated code/text tokens as they arrive
-static bool on_token_stream(const char* piece, void* user_data) {
-    (void)user_data;
-    printf("%s", piece);
-    fflush(stdout); // Real-time terminal output
-    return true;    // Return true to continue, false to interrupt
-}
-
-int main(int argc, char** argv) {
-    // Default model filename and coding prompt
-    const char* model_path = (argc >= 2) ? argv[1] : "qwen2.5-coder-7b-instruct-q4_k_m.gguf";
-    const char* user_prompt = (argc >= 3) ? argv[2] :
-        "Write a fast C function that performs binary search on a sorted integer array. Include short usage comments.";
-
-    printf("=======================================================\n");
-    printf(" Running libinfer with Qwen 2.5 Coder\n");
-    printf(" Model:  %s\n", model_path);
-    printf(" Prompt: %s\n", user_prompt);
-    printf("=======================================================\n\n");
-
-    // 2. Initialize inference context
+int main() {
+    // 1. Initialize the inference context
     infer_ctx* ctx = infer_init();
     if (!ctx) {
-        fprintf(stderr, "Error: Failed to initialize infer context.\n");
+        printf("Failed to initialize libinfer.\n");
         return 1;
     }
 
-    // 3. Load Qwen2.5-Coder GGUF Model (2048 token context window)
-    printf("Loading model weights into memory/GPU...\n");
-    if (!infer_load_model(ctx, model_path, 2048)) {
-        fprintf(stderr, "\nFailed to load model '%s':\n%s\n",
-            model_path, infer_get_last_error(ctx));
+    // 2. Load a model (requesting auto-sized context by passing 0)
+    printf("Loading model...\n");
+    if (!infer_load_model(ctx, "models/llama3-8b.gguf", 0)) {
+        char err[256];
+        infer_get_last_error(ctx, err, sizeof(err));
+        printf("Error loading model: %s\n", err);
         infer_free(ctx);
         return 1;
     }
 
-    // 4. Set optimal sampling parameters for code generation (Low temperature for precision)
-    infer_sampler_params sparams = infer_sampler_default_params();
-    sparams.temperature = 0.20f;  // Lower temperature produces more precise code
-    sparams.top_p = 0.95f;
-    sparams.top_k = 40;
-    sparams.seed = 42;
-    infer_set_sampler(ctx, &sparams);
-
-    // 5. Structure conversation with system prompt optimized for coding
-    infer_chat_msg chat[] = {
-        { "system", "You are an expert C/C++ coding assistant. Provide concise, clean, and bug-free code solutions." },
-        { "user",   user_prompt }
-    };
-    size_t num_msgs = sizeof(chat) / sizeof(chat[0]);
-
-    printf("\n--- Qwen2.5 Coder Response ---\n\n");
-
-    // 6. Run synchronous chat generation with streaming output
-    bool success = infer_generate_chat(ctx, chat, num_msgs, on_token_stream, NULL);
-
-    printf("\n\n-------------------------------\n");
-
-    if (!success) {
-        fprintf(stderr, "Inference error: %s\n", infer_get_last_error(ctx));
-    }
-
-    // 7. Cleanup resources
+    printf("Model loaded successfully!\n");
+    
+    // 3. Clean up
     infer_free(ctx);
-    printf("Inference context freed successfully.\n");
-
     return 0;
 }
+ 
 
+### 2. Synchronous Chat Generation with Streaming
 
+This example shows how to set up a stream callback to print tokens as they are generated, and how to execute a synchronous chat completion.
 
+ c
+#include <stdio.h>
+#include <string.h>
+#include "infer.h"
 
+// Stream callback to print generated pieces in real-time
+bool stream_callback(const char* piece, void* user_data) {
+    printf("%s", piece);
+    fflush(stdout);
+    return true; // Return false to abort generation
+}
 
+int main() {
+    infer_ctx* ctx = infer_init();
+    infer_load_model(ctx, "models/llama3-8b.gguf", 4096);
 
+    // Setup chat messages
+    infer_chat_msg msgs[] = {
+        {"system", "You are a helpful AI assistant."},
+        {"user", "Write a haiku about C++ programming."}
+    };
 
+    printf("Assistant: ");
+    
+    // Generate chat (max 100 tokens)
+    bool success = infer_generate_chat(
+        ctx, 
+        msgs, 
+        2,             // Number of messages
+        100,           // Max tokens to generate
+        stream_callback, 
+        NULL           // User data
+    );
 
+    printf("\n");
 
+    if (!success) {
+        char err[256];
+        infer_get_last_error(ctx, err, sizeof(err));
+        printf("Generation failed: %s\n", err);
+    }
 
+    infer_free(ctx);
+    return 0;
+}
+ 
 
+### 3. Extracting Embeddings
 
-# libinfer API Documentation
+This example demonstrates how to extract L2-normalized embeddings for a string of text.
 
-**`libinfer`** is a streamlined C/C++ inference engine wrapping `llama.cpp`. It provides hardware-accelerated LLM execution (via CUDA or Metal) with advanced features like persistent KV caching for multi-turn chat, asynchronous generation, grammar constraints, and embedding extraction.
+c
+#include <stdio.h>
+#include <stdlib.h>
+#include "infer.h"
 
-## 1. Core Lifecycle & Initialization
+int main() {
+    infer_ctx* ctx = infer_init();
+    
+    // Note: The loaded model must support embeddings
+    infer_load_model(ctx, "models/embedding-model.gguf", 1024);
 
-* **`infer_init()`**
-  Initializes the GGML backend and allocates an empty `infer_ctx` (inference context) handle.
+    // Get the required vector dimension
+    int32_t dim = infer_get_embedding_dim(ctx);
+    if (dim <= 0) {
+        printf("Model does not support embeddings.\n");
+        infer_free(ctx);
+        return 1;
+    }
 
-* **`infer_load_model(ctx, path, requested_ctx)`**
-  Loads a `.gguf` model file from disk into RAM/VRAM. It automatically probes your hardware and shrinks `requested_ctx` if you do not have enough VRAM available.
+    // Allocate memory for the output vector
+    float* embd = (float*)malloc(dim * sizeof(float));
+    
+    // Extract normalized embeddings (passing 'true' for normalize)
+    const char* text_to_embed = "This is a test document.";
+    if (infer_get_embeddings_ex(ctx, text_to_embed, embd, dim, true)) {
+        printf("Successfully generated embedding of size %d.\n", dim);
+        printf("First 3 values: [%f, %f, %f]\n", embd[0], embd[1], embd[2]);
+    } else {
+        char err[256];
+        infer_get_last_error(ctx, err, sizeof(err));
+        printf("Failed to get embeddings: %s\n", err);
+    }
 
-* **`infer_free(ctx)`**
-  Safely aborts any running generation, clears VRAM, and destroys the context.
-
----
-
-## 2. Text Generation & Chat
-
-* **`infer_generate_chat(ctx, msgs, num_msgs, callback, user_data)`**
-  **Single-shot mode:** Ingests an entire array of chat messages, generates a response, and triggers your `callback` for every generated token. *Note: This function wipes the KV cache before running, giving the AI "amnesia" from previous calls.*
-
-* **`infer_generate_chat_async(...)`**
-  Spawns a background thread (`std::thread`) to run generation without freezing your application's main thread or UI render loop.
-
-* **`infer_generate_chat_turn(ctx, role, content, callback, user_data)`**
-  **Multi-turn REPL mode:** Instead of clearing memory, this function tokenizes only your *newest* message and appends it to the existing KV cache (tracked by `n_past`). This makes follow-up questions evaluate instantly without recalculating the whole conversation history.
-
-* **`infer_generate_completion(ctx, raw_prompt, callback, user_data)`**
-  Bypasses Jinja chat templates entirely. It feeds raw text directly into the model, useful for code autocompletion or legacy base models.
-
----
-
-## 3. Memory & Session Management (KV Cache)
-
-* **`infer_memory_clear(ctx)`**
-  Forces the KV cache `n_past` tracker back to `0` and clears the hardware memory. Use this when the user clicks "New Chat".
-
-* **`infer_state_save(ctx, filepath)`**
-  Dumps the active KV cache memory to a file on your hard drive.
-
-* **`infer_state_load(ctx, filepath)`**
-  Reloads a previously saved KV cache file. This allows you to close your program, reopen it later, and instantly resume a conversation exactly where you left off.
-
----
-
-## 4. Advanced Control (Samplers, Grammar & Stops)
-
-* **`infer_set_sampler(ctx, params)`**
-  Updates parameters like `temperature`, `top_p`, `min_p`, and `repeat_penalty`. A temperature of `0.0f` enables greedy decoding (deterministic), while higher values increase creativity.
-
-* **`infer_set_grammar(ctx, grammar_gbnf)`**
-  Forces the AI to generate text that strictly matches a GBNF grammar schema. This is critical for forcing the AI to output valid JSON or specific tool-calling formats without syntax errors.
-
-* **`infer_set_stop_sequences(ctx, stop_words, num_words)`**
-  Provides a list of strings (e.g., `["User:", "<|endoftext|>"]`). The generation loop will immediately halt if the AI generates any of these exact strings.
-
----
-
-## 5. Embeddings (RAG)
-
-* **`infer_get_embedding_dim(ctx)`**
-  Returns the vector size for the loaded model (e.g., `4096`).
-
-* **`infer_get_embeddings(ctx, text, out_vec, vec_len)`**
-  Converts a string of text into a high-dimensional float array (`out_vec`) instead of generating text. Used for semantic search and Retrieval-Augmented Generation (RAG).
-
----
-
-## 6. Thread Control & Diagnostics
-
-* **`infer_abort(ctx)`**
-  Flips an atomic boolean flag (`abort_flag`) that instantly halts the active generation loop.
-
-* **`infer_is_generating(ctx)`**
-  Returns `true` if the background async worker is currently busy.
-
-* **`infer_get_model_info(ctx, out_info)`**
-  Extracts metadata directly from the `.gguf` file, including layer count, attention heads, context limit (`n_ctx_train`), and architecture description.
-
-* **`infer_get_last_error(ctx)`**
-  Returns a thread-safe string explaining the most recent failure (e.g., *"Prompt tokens exceed context capacity"*).
-
+    free(embd);
+    infer_free(ctx);
+    return 0;
+}
  
