@@ -1223,12 +1223,11 @@ uint32_t calculate_safe_n_ctx(
     uint32_t auto_tier_ctx = DEFAULT_FALLBACK_CTX;
     if (total_vram == 0 || n_gpu_layers == 0) {
         auto_tier_ctx = (free_sys_ram >= (12000ULL * 1024ULL * 1024ULL)) ? 8192 : 4096;
-    } else if (total_vram <= (4600ULL * 1024ULL * 1024ULL)) {
+   } else if (total_vram <= (4600ULL * 1024ULL * 1024ULL)) {
         auto_tier_ctx = 2048;
+    } else if (total_vram <= (6500ULL * 1024ULL * 1024ULL)) {
+        auto_tier_ctx = 8192; // ADD THIS LINE for 6GB GPUs
     } else if (total_vram >= (14000ULL * 1024ULL * 1024ULL)) {
-        auto_tier_ctx = 16384;
-    } else if (total_vram >= (7500ULL * 1024ULL * 1024ULL)) {
-        auto_tier_ctx = 8192;
     }
 
     uint32_t target_ctx = (requested_ctx > 0) ? requested_ctx : auto_tier_ctx;
@@ -2323,7 +2322,7 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
             return false;
         }
 
-        constexpr uint64_t KV_AND_COMPUTE_VRAM_RESERVE = 1536ULL * 1024ULL * 1024ULL;
+        constexpr uint64_t KV_AND_COMPUTE_VRAM_RESERVE = 512ULL * 1024ULL * 1024ULL;
         const uint64_t effective_model_bytes = (total_tensor_bytes > 0) ? total_tensor_bytes : model_file_bytes;
 
         auto query_usable_vram = [&]() -> uint64_t {
