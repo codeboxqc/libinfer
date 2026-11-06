@@ -228,4 +228,77 @@ int main() {
     infer_free(ctx);
     return 0;
 }
- 
+
+
+
+
+ ## Features
+* **Thread-Safe**: Safely call abort, wait, and state checks from any thread.
+* **Auto GPU/CPU Scaling**: Automatically detects system RAM/VRAM and distributes layers dynamically.
+* **State Persistence**: Save and load KV cache and chat history to disk with CRC32 verification.
+* **Async Generation**: Built-in background worker thread for non-blocking UI integration.
+* **Streaming Callbacks**: Real-time token streaming with safe abortion hooks.
+* **Advanced Sampling**: Full support for Top-K, Top-P, Min-P, GBNF grammars, and repetition penalties.
+
+## Build and Install
+
+This project uses CMake and optionally vcpkg.
+
+```bash
+# Clone with submodules (required for llama.cpp)
+git clone --recursive https://github.com/codeboxqc/libinfer.git
+cd libinfer
+
+# Build
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . --config Release
+```
+
+---
+
+## API Reference (Wiki)
+
+Here is a detailed breakdown of all functions available in `infer.h`. 
+
+### Initialization & Lifecycle
+* `infer_init()` / `infer_init_ex()`: Initializes the backend and allocates a new inference context (`infer_ctx`).
+* `infer_free(infer_ctx* ctx)`: Safely aborts any running generation, clears memory, and destroys the context.
+* `infer_version()`: Returns the compiled version integer.
+
+### Model Management
+* `infer_load_model(infer_ctx* ctx, const char* path, uint32_t requested_ctx)`: Loads a `.gguf` model using default auto-scaling parameters.
+* `infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_params* params)`: Loads a model with explicit GPU offload, mmap, mlock, and Flash Attention settings.
+* `infer_unload_model(infer_ctx* ctx)`: Unloads the active model and releases VRAM/RAM without destroying the context.
+* `infer_get_model_info(infer_ctx* ctx, infer_model_info* out_info)`: Retrieves model metadata (layers, dimensions, active context).
+
+### Configuration
+* `infer_set_sampler(infer_ctx* ctx, const infer_sampler_params* params)`: Updates the sampler chain (temperature, top-p, min-p, etc.).
+* `infer_set_chat_template(infer_ctx* ctx, const char* custom_template)`: Overrides the built-in Jinja chat template.
+* `infer_set_stop_sequences(infer_ctx* ctx, const char* const* stop_words, size_t num_words)`: Configures custom stop words.
+* `infer_set_grammar(infer_ctx* ctx, const char* grammar_gbnf)`: Constrains output using a GBNF grammar string.
+* `infer_set_log_callback(infer_log_cb callback, void* user_data)`: Hooks into the backend logging system.
+
+### Generation & Chat
+* `infer_generate_chat(...)` / `infer_generate_chat_v2(...)`: Synchronous chat generation over an array of messages.
+* `infer_generate_chat_async(...)` / `infer_generate_chat_async_v2(...)`: Non-blocking chat generation on a background thread.
+* `infer_generate_chat_turn(...)` / `infer_generate_chat_turn_v2(...)`: Appends a single turn to the ongoing history, reusing the KV cache prefix automatically.
+* `infer_generate_completion(...)` / `infer_generate_completion_v2(...)`: Raw text completion without chat templates.
+
+### State & Memory Management
+* `infer_memory_clear(infer_ctx* ctx)`: Clears the KV cache and empties the stored chat history.
+* `infer_state_save(infer_ctx* ctx, const char* filepath)`: Atomically saves KV cache and chat history to disk.
+* `infer_state_load(infer_ctx* ctx, const char* filepath)`: Restores KV cache and chat history from disk.
+* `infer_get_kv_cache_token_count(infer_ctx* ctx)`: Returns the number of active tokens in the KV cache.
+
+### Embeddings
+* `infer_get_embeddings(infer_ctx* ctx, const char* text, float* out_vec, size_t vec_len)`: Computes raw unnormalized embeddings.
+* `infer_get_embeddings_ex(...)`: Computes embeddings with optional L2 normalization.
+* `infer_get_embedding_dim(infer_ctx* ctx)`: Returns the embedding dimension (`n_embd`) of the loaded model.
+
+### Concurrency & Synchronization
+* `infer_abort(infer_ctx* ctx)`: Asynchronously halts any in-flight generation.
+* `infer_wait(infer_ctx* ctx)`: Blocks until active async generation completes.
+* `infer_is_generating(infer_ctx* ctx)`: Returns `true` if the context is currently busy.
+* `infer_last_success(infer_ctx* ctx)`: Returns `true` if the last generation/embedding task completed without errors.
+* `infer_get_last_error(infer_ctx* ctx, char* out_buf, size_t buf_size)`: Retrieves the last error message string.
