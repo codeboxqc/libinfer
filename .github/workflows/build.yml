@@ -17,13 +17,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Pin windows-2022 & ubuntu-24.04 so CUDA 12.4 compiles cleanly
+          # (ubuntu-latest moved to Ubuntu 26.04 which replaced libxml2.so.2 with libxml2.so.16 and bumped GCC/glibc)
           - os: windows-2022
             name: windows-x64
             ext: dll
             cli: infer_cli.exe
             use_cuda: true
             use_vulkan: true
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             name: linux-x64
             ext: so
             cli: infer_cli
@@ -47,7 +49,13 @@ jobs:
       run: |
         rm -rf third_party/llama.cpp
         mkdir -p third_party
-        git clone --depth 1 https://github.com/ggerganov/llama.cpp.git third_party/llama.cpp
+        git clone --depth 1 https://github.com/ggml-org/llama.cpp.git third_party/llama.cpp
+
+    - name: Ensure CUDA Installer Dependencies (Linux)
+      if: runner.os == 'Linux' && matrix.use_cuda
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libxml2
 
     - name: Install CUDA Toolkit
       if: matrix.use_cuda
@@ -59,7 +67,7 @@ jobs:
       if: matrix.use_vulkan
       uses: jakoch/install-vulkan-sdk-action@v1
       with:
-        install_runtime: true
+        install_runtime: ${{ runner.os == 'Windows' }}
         cache: true
 
     - name: Setup Ninja (For faster, reliable builds)
@@ -72,14 +80,19 @@ jobs:
     - name: Configure CMake
       shell: bash
       run: |
-        EXTRA_FLAGS=""
+        EXTRA_FLAGS=()
         if [ "${{ matrix.use_cuda }}" = "true" ]; then
-          EXTRA_FLAGS="$EXTRA_FLAGS -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75;80;86;89"
+          EXTRA_FLAGS+=(-DGGML_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89")
+          if [ "${{ runner.os }}" = "Linux" ] && command -v g++-13 >/dev/null 2>&1; then
+            export CC=gcc-13
+            export CXX=g++-13
+            EXTRA_FLAGS+=("-DCMAKE_CUDA_HOST_COMPILER=$(command -v g++-13)")
+          fi
         fi
         if [ "${{ matrix.use_vulkan }}" = "true" ]; then
-          EXTRA_FLAGS="$EXTRA_FLAGS -DGGML_VULKAN=ON"
+          EXTRA_FLAGS+=(-DGGML_VULKAN=ON)
         fi
-        cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF $EXTRA_FLAGS
+        cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}
 
     - name: Build Project
       run: cmake --build build --config Release
@@ -87,18 +100,37 @@ jobs:
     - name: Stage Artifacts
       shell: bash
       run: |
-        mkdir -p staging/cuda
-        mkdir -p staging/vulkan
+        mkdir -p staging
 
-        # 1. Copy ALL root dynamic libraries (infer.dll, llama.dll, ggml.dll, ggml-cpu.dll) and EXEs
-        find build -name "*.${{ matrix.ext }}" ! -name "*ggml-cuda*" ! -name "*ggml-vulkan*" -exec cp {} staging/ \;
-        find build -maxdepth 2 -name "*.lib" -exec cp {} staging/ \;
-        find build -maxdepth 2 -name "${{ matrix.cli }}" -type f -exec cp {} staging/ \;
+        # 1. Copy root dynamic libraries (infer, llama, ggml, ggml-base, ggml-cpu, ggml-metal) and EXEs
+        if [ "${{ runner.os }}" = "Linux" ]; then
+          find build \( -type f -o -type l \) ! -path "*/CMakeFiles/*" \
+            \( -name "*.so" -o -name "*.so.*" \) \
+            ! -name "*ggml-cuda*" ! -name "*ggml-vulkan*" \
+            -exec cp -a {} staging/ \;
+        else
+          find build \( -type f -o -type l \) ! -path "*/CMakeFiles/*" \
+            -name "*.${{ matrix.ext }}" \
+            ! -name "*ggml-cuda*" ! -name "*ggml-vulkan*" \
+            -exec cp -a {} staging/ \;
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            find build -type f ! -path "*/CMakeFiles/*" -name "libggml-*.so" -exec cp {} staging/ \;
+          fi
+        fi
+        find build -maxdepth 2 -type f -name "*.lib" -exec cp {} staging/ \;
+        find build -maxdepth 2 -type f -name "${{ matrix.cli }}" -exec cp {} staging/ \;
         cp include/infer.h staging/ 2>/dev/null || true
 
-        # 2. Copy CUDA backend dynamic library and CUDA runtimes into cuda/
+        # 2. Copy CUDA backend dynamic library and Windows CUDA runtimes into cuda/
         if [ "${{ matrix.use_cuda }}" = "true" ]; then
-          find build -name "*ggml-cuda*" -exec cp {} staging/cuda/ \;
+          mkdir -p staging/cuda
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            find build \( -type f -o -type l \) ! -path "*/CMakeFiles/*" \
+              \( -name "*ggml-cuda*.so" -o -name "*ggml-cuda*.so.*" \) \
+              -exec cp -a {} staging/cuda/ \;
+          else
+            find build -type f ! -path "*/CMakeFiles/*" -name "*ggml-cuda*.${{ matrix.ext }}" -exec cp {} staging/cuda/ \;
+          fi
           if [ "${{ runner.os }}" = "Windows" ]; then
             CUDA_BIN="$CUDA_PATH/bin"
             cp "$CUDA_BIN"/cudart64_*.dll staging/cuda/ || true
@@ -107,10 +139,20 @@ jobs:
           fi
         fi
 
-        # 3. Copy Vulkan backend into vulkan/
+        # 3. Copy Vulkan backend dynamic library into vulkan/
         if [ "${{ matrix.use_vulkan }}" = "true" ]; then
-          find build -name "*ggml-vulkan*" -exec cp {} staging/vulkan/ \;
+          mkdir -p staging/vulkan
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            find build \( -type f -o -type l \) ! -path "*/CMakeFiles/*" \
+              \( -name "*ggml-vulkan*.so" -o -name "*ggml-vulkan*.so.*" \) \
+              -exec cp -a {} staging/vulkan/ \;
+          else
+            find build -type f ! -path "*/CMakeFiles/*" -name "*ggml-vulkan*.${{ matrix.ext }}" -exec cp {} staging/vulkan/ \;
+          fi
         fi
+
+        echo "=== Staged files ==="
+        find staging -maxdepth 2 | sort
 
     - name: Package Zip
       shell: bash
@@ -119,7 +161,7 @@ jobs:
         if [ "${{ runner.os }}" = "Windows" ]; then
           7z a ../libinfer-${{ matrix.name }}.zip *
         else
-          zip -r ../libinfer-${{ matrix.name }}.zip *
+          zip -ry ../libinfer-${{ matrix.name }}.zip *
         fi
 
     - name: Upload Actions Artifact
@@ -132,7 +174,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
-    
+
     steps:
     - name: Download all zipped artifacts
       uses: actions/download-artifact@v4
