@@ -1128,6 +1128,59 @@ bool internal_abort_cb(void* data) {
            ctx->shutting_down.load(std::memory_order_relaxed);
 }
 
+bool internal_load_progress_cb(float progress, void* data) {
+    (void)progress;
+    auto* ctx = static_cast<infer_ctx*>(data);
+    if (!ctx) return true;
+    return !(ctx->abort_flag.load(std::memory_order_relaxed) ||
+             ctx->shutting_down.load(std::memory_order_relaxed));
+}
+
+// Enumerate unique physical GPU/iGPU devices, deduplicating backends that expose
+// the same PCI device (e.g. CUDA0 + Vulkan0 on the same NVIDIA GPU), matching
+// llama.cpp's llama_prepare_model_devices() deduplication rules.
+std::vector<ggml_backend_dev_t> enumerate_unique_gpu_devices() {
+    std::vector<ggml_backend_dev_t> unique_devs;
+    std::vector<std::string> seen_ids;
+    const size_t dev_count = ggml_backend_dev_count();
+    unique_devs.reserve(dev_count);
+    seen_ids.reserve(dev_count);
+
+    for (size_t i = 0; i < dev_count; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) continue;
+        auto dtype = ggml_backend_dev_type(dev);
+        if (dtype != GGML_BACKEND_DEVICE_TYPE_GPU && dtype != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        struct ggml_backend_dev_props props{};
+        ggml_backend_dev_get_props(dev, &props);
+        if (props.device_id && props.device_id[0] != '\0') {
+            std::string id_str(props.device_id);
+            bool duplicate = false;
+            for (const auto& seen : seen_ids) {
+                if (seen == id_str) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
+            seen_ids.push_back(std::move(id_str));
+        }
+        unique_devs.push_back(dev);
+    }
+    return unique_devs;
+}
+
+uint64_t compute_gpu_compute_headroom(uint64_t total_vram) {
+    constexpr uint64_t MIN_HEADROOM = 384ULL * 1024ULL * 1024ULL;
+    constexpr uint64_t MAX_HEADROOM = 1024ULL * 1024ULL * 1024ULL;
+    if (total_vram == 0) return MIN_HEADROOM;
+    return std::clamp<uint64_t>(total_vram / 12, MIN_HEADROOM, MAX_HEADROOM);
+}
+
 bool infer_has_real_gpu() {
     size_t count = ggml_backend_dev_count();
     for (size_t i = 0; i < count; ++i) {
@@ -1195,15 +1248,14 @@ uint32_t calculate_safe_n_ctx(
 
     uint64_t total_vram = 0;
     uint64_t free_vram  = 0;
-    size_t dev_count  = ggml_backend_dev_count();
+    const auto gpu_devs = enumerate_unique_gpu_devices();
     size_t dgpu_count = 0;
-    for (size_t i = 0; i < dev_count; ++i) {
-        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+    for (ggml_backend_dev_t dev : gpu_devs) {
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
             dgpu_count++;
         }
     }
-    for (size_t i = 0; i < dev_count; ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+    for (ggml_backend_dev_t dev : gpu_devs) {
         auto dtype = ggml_backend_dev_type(dev);
         const bool use_dev = (dgpu_count > 0)
                                  ? (dtype == GGML_BACKEND_DEVICE_TYPE_GPU)
@@ -1215,19 +1267,18 @@ uint32_t calculate_safe_n_ctx(
             free_vram  += static_cast<uint64_t>(dev_free);
         }
     }
-	
-	
 
     uint64_t free_sys_ram = query_system_free_ram();
 
     uint32_t auto_tier_ctx = DEFAULT_FALLBACK_CTX;
     if (total_vram == 0 || n_gpu_layers == 0) {
         auto_tier_ctx = (free_sys_ram >= (12000ULL * 1024ULL * 1024ULL)) ? 8192 : 4096;
-   } else if (total_vram <= (4600ULL * 1024ULL * 1024ULL)) {
+    } else if (total_vram <= (4600ULL * 1024ULL * 1024ULL)) {
         auto_tier_ctx = 2048;
     } else if (total_vram <= (6500ULL * 1024ULL * 1024ULL)) {
-        auto_tier_ctx = 8192; // ADD THIS LINE for 6GB GPUs
+        auto_tier_ctx = 8192;
     } else if (total_vram >= (14000ULL * 1024ULL * 1024ULL)) {
+        auto_tier_ctx = 16384;
     }
 
     uint32_t target_ctx = (requested_ctx > 0) ? requested_ctx : auto_tier_ctx;
@@ -1279,9 +1330,7 @@ uint32_t calculate_safe_n_ctx(
         return fallback_ctx;
     }
 
-    const uint64_t gpu_headroom = (total_vram > 0)
-        ? std::max<uint64_t>(1024ULL * 1024ULL * 1024ULL, total_vram / 8)
-        : 1024ULL * 1024ULL * 1024ULL;
+    const uint64_t gpu_headroom = compute_gpu_compute_headroom(total_vram);
     const uint64_t cpu_headroom = 1024ULL * 1024ULL * 1024ULL;
 
     uint64_t max_tokens_gpu = UINT64_MAX;
@@ -1564,6 +1613,9 @@ void free_model_resources_locked(infer_ctx* ctx) {
     ctx->n_past.store(0, std::memory_order_relaxed);
     ctx->chat_history.clear();
     ctx->active_kv_tokens.clear();
+    ctx->loaded_model_path.clear();
+    ctx->loaded_model_params = infer_model_default_params();
+    ctx->loaded_gpu_layers   = 0;
 }
 
 bool execute_decode(
@@ -2244,19 +2296,22 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
 
     // If caller did not set custom tensor_split and both discrete GPU and slow iGPU exist,
     // automatically exclude the iGPU so it never bottlenecks the discrete GPU.
+    // Enumerate deduplicated physical GPU devices so tensor_split indices align with
+    // llama.cpp's deduplicated device list (e.g., when CUDA0 and Vulkan0 expose the same GPU).
     if (split_weight_sum == 0.0 && mparams.split_mode != 0) {
         size_t dgpu_count = 0;
         size_t igpu_count = 0;
-        size_t dev_count  = ggml_backend_dev_count();
-        for (size_t i = 0; i < dev_count; ++i) {
-            auto dtype = ggml_backend_dev_type(ggml_backend_dev_get(i));
+        const auto unique_devs = enumerate_unique_gpu_devices();
+        for (ggml_backend_dev_t dev : unique_devs) {
+            auto dtype = ggml_backend_dev_type(dev);
             if (dtype == GGML_BACKEND_DEVICE_TYPE_GPU)  dgpu_count++;
             if (dtype == GGML_BACKEND_DEVICE_TYPE_IGPU) igpu_count++;
         }
         if (dgpu_count > 0 && igpu_count > 0) {
             size_t gpu_idx = 0;
-            for (size_t i = 0; i < dev_count && gpu_idx < 128; ++i) {
-                auto dtype = ggml_backend_dev_type(ggml_backend_dev_get(i));
+            for (ggml_backend_dev_t dev : unique_devs) {
+                if (gpu_idx >= 128) break;
+                auto dtype = ggml_backend_dev_type(dev);
                 if (dtype == GGML_BACKEND_DEVICE_TYPE_GPU) {
                     mparams.tensor_split[gpu_idx++] = 1.0f;
                     split_weight_sum += 1.0;
@@ -2299,12 +2354,22 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
         probe_mparams.main_gpu     = mparams.main_gpu;
         probe_mparams.split_mode   = static_cast<enum llama_split_mode>(mparams.split_mode);
         probe_mparams.tensor_split = has_custom_split ? mparams.tensor_split : nullptr;
+        probe_mparams.progress_callback           = internal_load_progress_cb;
+        probe_mparams.progress_callback_user_data = ctx;
         apply_model_load_params(probe_mparams, true, false);
 
         std::unique_ptr<llama_model, decltype(&llama_model_free)> probe_model(
             llama_model_load_from_file(path, probe_mparams), &llama_model_free);
         if (!probe_model) {
-            ctx->set_error("Failed to load model from path: " + std::string(path));
+            if (internal_abort_cb(ctx)) {
+                ctx->set_error("Model loading aborted.");
+            } else {
+                ctx->set_error("Failed to load model from path: " + std::string(path));
+            }
+            return false;
+        }
+        if (internal_abort_cb(ctx)) {
+            ctx->set_error("Model loading aborted.");
             return false;
         }
 
@@ -2322,7 +2387,7 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
             return false;
         }
 
-        constexpr uint64_t KV_AND_COMPUTE_VRAM_RESERVE = 512ULL * 1024ULL * 1024ULL;
+        constexpr uint64_t MIN_KV_CACHE_VRAM_RESERVE = 256ULL * 1024ULL * 1024ULL;
         const uint64_t effective_model_bytes = (total_tensor_bytes > 0) ? total_tensor_bytes : model_file_bytes;
 
         auto query_usable_vram = [&]() -> uint64_t {
@@ -2330,24 +2395,22 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
             uint64_t split_bounded_usable = UINT64_MAX;
             double active_dev_weight_sum = 0.0;
             size_t gpu_idx = 0;
-            size_t dev_count = ggml_backend_dev_count();
+            const auto unique_devs = enumerate_unique_gpu_devices();
 
             std::vector<uint64_t> dev_avails;
-            for (size_t i = 0; i < dev_count; ++i) {
-                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-                auto dtype = ggml_backend_dev_type(dev);
-                if (dtype == GGML_BACKEND_DEVICE_TYPE_GPU || dtype == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                    size_t df = 0, dt = 0;
-                    ggml_backend_dev_memory(dev, &df, &dt);
-                    uint64_t dev_avail = (static_cast<uint64_t>(df) > KV_AND_COMPUTE_VRAM_RESERVE)
-                                             ? (static_cast<uint64_t>(df) - KV_AND_COMPUTE_VRAM_RESERVE)
-                                             : 0;
-                    dev_avails.push_back(dev_avail);
-                    if (gpu_idx < 128 && mparams.tensor_split[gpu_idx] > 0.0f) {
-                        active_dev_weight_sum += static_cast<double>(mparams.tensor_split[gpu_idx]);
-                    }
-                    gpu_idx++;
+            dev_avails.reserve(unique_devs.size());
+            for (ggml_backend_dev_t dev : unique_devs) {
+                size_t df = 0, dt = 0;
+                ggml_backend_dev_memory(dev, &df, &dt);
+                const uint64_t reserve = compute_gpu_compute_headroom(static_cast<uint64_t>(dt)) + MIN_KV_CACHE_VRAM_RESERVE;
+                uint64_t dev_avail = (static_cast<uint64_t>(df) > reserve)
+                                         ? (static_cast<uint64_t>(df) - reserve)
+                                         : 0;
+                dev_avails.push_back(dev_avail);
+                if (gpu_idx < 128 && mparams.tensor_split[gpu_idx] > 0.0f) {
+                    active_dev_weight_sum += static_cast<double>(mparams.tensor_split[gpu_idx]);
                 }
+                gpu_idx++;
             }
 
             if (dev_avails.empty()) return 0;
@@ -2425,11 +2488,18 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
                 }
             }
 
+            if (internal_abort_cb(ctx)) {
+                err_msg = "Model loading aborted.";
+                return false;
+            }
+
             struct llama_model_params llama_mparams = llama_model_default_params();
             llama_mparams.n_gpu_layers = gpu_layers;
             llama_mparams.main_gpu     = lp.main_gpu;
             llama_mparams.split_mode   = static_cast<enum llama_split_mode>(lp.split_mode);
             llama_mparams.tensor_split = lp_has_split ? lp.tensor_split : nullptr;
+            llama_mparams.progress_callback           = internal_load_progress_cb;
+            llama_mparams.progress_callback_user_data = ctx;
             apply_model_load_params(llama_mparams, lp.use_mmap, lp.use_mlock);
 
             if (reusable_cpu_model && gpu_layers == 0 && lp.use_mmap && !lp.use_mlock) {
@@ -2440,7 +2510,13 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
             }
 
             if (!out_model) {
-                err_msg = "Failed to load model from path: " + std::string(load_path);
+                err_msg = internal_abort_cb(ctx)
+                              ? "Model loading aborted."
+                              : ("Failed to load model from path: " + std::string(load_path));
+                return false;
+            }
+            if (internal_abort_cb(ctx)) {
+                err_msg = "Model loading aborted.";
                 return false;
             }
 
@@ -2472,6 +2548,10 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
 
             uint32_t candidate_ctx = safe_ctx;
             while (candidate_ctx >= 256) {
+                if (internal_abort_cb(ctx)) {
+                    err_msg = "Model loading aborted.";
+                    return false;
+                }
                 struct llama_context_params ctx_params = llama_context_default_params();
                 ctx_params.n_ctx           = candidate_ctx;
                 ctx_params.n_batch         = std::min<uint32_t>(candidate_ctx, DEFAULT_BATCH_CAP);
@@ -2550,7 +2630,7 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
                 new_model, new_lctx, new_sampler, new_pen, new_n_ctx, load_err);
         }
 
-        if (!loaded_ok && had_old_model) {
+        if (!loaded_ok && had_old_model && !internal_abort_cb(ctx)) {
             probe_model.reset();
             new_sampler.reset();
             new_lctx.reset();
@@ -2566,7 +2646,7 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
                 path, mparams, target_gpu_layers, std::move(empty_probe),
                 new_model, new_lctx, new_sampler, new_pen, new_n_ctx, load_err);
 
-            if (!loaded_ok && !backup_path.empty()) {
+            if (!loaded_ok && !backup_path.empty() && !internal_abort_cb(ctx)) {
                 std::unique_ptr<llama_model, decltype(&llama_model_free)> r_model(nullptr, &llama_model_free);
                 std::unique_ptr<llama_context, decltype(&llama_free)> r_lctx(nullptr, &llama_free);
                 UniqueSampler r_sampler(nullptr, &llama_sampler_free);
@@ -2597,6 +2677,9 @@ bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_par
         }
 
         if (!loaded_ok) {
+            if (load_err.empty() && internal_abort_cb(ctx)) {
+                load_err = "Model loading aborted.";
+            }
             ctx->set_error(load_err);
             return false;
         }
