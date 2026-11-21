@@ -16,6 +16,8 @@ set(BUILD_SHARED_LIBS ON CACHE BOOL "Build shared libraries for backends" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "Do not build llama.cpp examples" FORCE)
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Do not build llama.cpp tests" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "Do not build llama.cpp server" FORCE)
+set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "Do not build llama.cpp tools" FORCE)
+set(LLAMA_BUILD_COMMON OFF CACHE BOOL "Do not build llama.cpp common" FORCE)
 
 # Enable CUDA backend in llama.cpp if requested
 option(GGML_CUDA "Enable CUDA backend" OFF)
@@ -62,6 +64,19 @@ set_target_properties(infer_core PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     OUTPUT_NAME "infer"
 )
+
+# Resolve sibling shared libraries (libllama, libggml) from the same directory when packaged
+if(UNIX AND NOT APPLE)
+    set_target_properties(infer_core PROPERTIES
+        BUILD_RPATH "$ORIGIN"
+        INSTALL_RPATH "$ORIGIN"
+    )
+elseif(APPLE)
+    set_target_properties(infer_core PROPERTIES
+        BUILD_RPATH "@loader_path"
+        INSTALL_RPATH "@loader_path"
+    )
+endif()
 
 # Export macro definitions for DLL/SO symbol visibility
 target_compile_definitions(infer_core
