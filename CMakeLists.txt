@@ -18,12 +18,29 @@ set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Do not build llama.cpp tests" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "Do not build llama.cpp server" FORCE)
 set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "Do not build llama.cpp tools" FORCE)
 set(LLAMA_BUILD_COMMON OFF CACHE BOOL "Do not build llama.cpp common" FORCE)
+set(LLAMA_CURL OFF CACHE BOOL "Disable libcurl in llama.cpp" FORCE)
 
 # Enable CUDA backend in llama.cpp if requested
 option(GGML_CUDA "Enable CUDA backend" OFF)
 
-# Enable Vulkan backend in llama.cpp if requested (For Intel/AMD/NVIDIA GPUs)
+# Enable Vulkan backend in llama.cpp if requested (For Intel/AMD/NVIDIA/ARM Mali/Adreno GPUs)
 option(GGML_VULKAN "Enable Vulkan backend" OFF)
+
+# Enable OpenCL backend in llama.cpp if requested (For ARM Mali/Adreno GPUs)
+option(GGML_OPENCL "Enable OpenCL backend" OFF)
+
+# Build CLI example executables when present
+option(INFER_BUILD_EXAMPLES "Build example CLI executables" ON)
+
+# Ensure sibling and parent shared libraries (libggml-base, libllama) resolve cleanly
+# when dynamic backends are packaged in subdirectories (cuda/, vulkan/, opencl/).
+if(UNIX AND NOT APPLE)
+    set(CMAKE_BUILD_RPATH "$ORIGIN:$ORIGIN/..")
+    set(CMAKE_INSTALL_RPATH "$ORIGIN:$ORIGIN/..")
+elseif(APPLE)
+    set(CMAKE_BUILD_RPATH "@loader_path;@loader_path/..")
+    set(CMAKE_INSTALL_RPATH "@loader_path;@loader_path/..")
+endif()
 
 # Add llama.cpp as third-party dependency
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/CMakeLists.txt")
@@ -52,11 +69,6 @@ if(TARGET llama AND TARGET ggml)
     target_link_libraries(infer_core PRIVATE llama ggml)
 endif()
 
-# Link DXGI on Windows for automatic GPU hardware detection
-if(WIN32)
-    target_link_libraries(infer_core PRIVATE dxgi)
-endif()
-
 # Enforce strict symbol visibility: hide internal symbols by default
 set_target_properties(infer_core PROPERTIES
     CXX_VISIBILITY_PRESET hidden
@@ -68,13 +80,13 @@ set_target_properties(infer_core PROPERTIES
 # Resolve sibling shared libraries (libllama, libggml) from the same directory when packaged
 if(UNIX AND NOT APPLE)
     set_target_properties(infer_core PROPERTIES
-        BUILD_RPATH "$ORIGIN"
-        INSTALL_RPATH "$ORIGIN"
+        BUILD_RPATH "$ORIGIN:$ORIGIN/.."
+        INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
     )
 elseif(APPLE)
     set_target_properties(infer_core PROPERTIES
-        BUILD_RPATH "@loader_path"
-        INSTALL_RPATH "@loader_path"
+        BUILD_RPATH "@loader_path;@loader_path/.."
+        INSTALL_RPATH "@loader_path;@loader_path/.."
     )
 endif()
 
@@ -85,10 +97,40 @@ target_compile_definitions(infer_core
 )
 
 # -----------------------------------------------------------------------------
-# Example CLI target
+# Example CLI targets
 # -----------------------------------------------------------------------------
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/main.c")
-    add_executable(infer_cli examples/main.c)
-    target_link_libraries(infer_cli PRIVATE infer_core)
-    target_include_directories(infer_cli PRIVATE include)
+if(INFER_BUILD_EXAMPLES)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/main.c")
+        add_executable(infer_cli examples/main.c)
+        target_link_libraries(infer_cli PRIVATE infer_core)
+        target_include_directories(infer_cli PRIVATE include)
+        if(UNIX AND NOT APPLE)
+            set_target_properties(infer_cli PROPERTIES
+                BUILD_RPATH "$ORIGIN"
+                INSTALL_RPATH "$ORIGIN"
+            )
+        elseif(APPLE)
+            set_target_properties(infer_cli PROPERTIES
+                BUILD_RPATH "@loader_path"
+                INSTALL_RPATH "@loader_path"
+            )
+        endif()
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/orange_pi_chat.c")
+        add_executable(infer_orange_pi examples/orange_pi_chat.c)
+        target_link_libraries(infer_orange_pi PRIVATE infer_core)
+        target_include_directories(infer_orange_pi PRIVATE include)
+        if(UNIX AND NOT APPLE)
+            set_target_properties(infer_orange_pi PROPERTIES
+                BUILD_RPATH "$ORIGIN"
+                INSTALL_RPATH "$ORIGIN"
+            )
+        elseif(APPLE)
+            set_target_properties(infer_orange_pi PROPERTIES
+                BUILD_RPATH "@loader_path"
+                INSTALL_RPATH "@loader_path"
+            )
+        endif()
+    endif()
 endif()

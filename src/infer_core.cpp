@@ -34,11 +34,15 @@
 #else
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <mach/mach.h>
+#endif
+#if defined(__linux__)
+#include <dirent.h>
 #endif
 #endif
 
@@ -73,17 +77,39 @@ uint32_t detect_physical_cores() {
         std::vector<uint8_t> buffer(length);
         auto* info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data());
         if (GetLogicalProcessorInformationEx(RelationProcessorCore, info, &length)) {
-            uint32_t cores = 0;
+            uint32_t total_cores = 0;
+#if defined(_M_ARM64) || defined(__aarch64__)
+            std::vector<BYTE> eff_classes;
+            BYTE min_eff = 255;
+            BYTE max_eff = 0;
+#endif
             DWORD offset = 0;
             while (offset < length) {
                 auto* current = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data() + offset);
                 if (current->Relationship == RelationProcessorCore) {
-                    cores++;
+                    total_cores++;
+#if defined(_M_ARM64) || defined(__aarch64__)
+                    BYTE ec = current->Processor.EfficiencyClass;
+                    eff_classes.push_back(ec);
+                    if (ec < min_eff) min_eff = ec;
+                    if (ec > max_eff) max_eff = ec;
+#endif
                 }
                 if (current->Size == 0) break;
                 offset += current->Size;
             }
-            if (cores > 0) return cores;
+#if defined(_M_ARM64) || defined(__aarch64__)
+            // On heterogeneous big.LITTLE Windows ARM64 SoCs (e.g. SQ3, Orange Pi 6 WoA),
+            // exclude the lowest efficiency cluster so slow LITTLE cores don't stall barrier syncs.
+            if (total_cores > 0 && min_eff < max_eff) {
+                uint32_t perf_cores = 0;
+                for (BYTE ec : eff_classes) {
+                    if (ec > min_eff) perf_cores++;
+                }
+                if (perf_cores > 0) return perf_cores;
+            }
+#endif
+            if (total_cores > 0) return total_cores;
         }
     }
 #elif defined(__APPLE__)
@@ -93,6 +119,108 @@ uint32_t detect_physical_cores() {
         return static_cast<uint32_t>(phys);
     }
 #elif defined(__linux__)
+    // Enumerate online physical cores via sysfs topology (works on both x86_64 and ARM64 SBCs
+    // such as Orange Pi 5 RK3588 and Orange Pi 6 CIX P1, where /proc/cpuinfo has no "cpu cores").
+    auto read_uint_file = [](const std::string& path, uint64_t& out) -> bool {
+        FILE* fp = std::fopen(path.c_str(), "r");
+        if (!fp) return false;
+        char buf[64] = {};
+        bool ok = false;
+        if (std::fgets(buf, sizeof(buf), fp)) {
+            char* endp = nullptr;
+            unsigned long long v = std::strtoull(buf, &endp, 10);
+            if (endp != buf && v > 0) {
+                out = static_cast<uint64_t>(v);
+                ok = true;
+            }
+        }
+        std::fclose(fp);
+        return ok;
+    };
+
+    DIR* dir = ::opendir("/sys/devices/system/cpu");
+    if (dir) {
+        struct CoreInfo {
+            int      cpu_id = 0;
+            uint64_t score  = 0; // cpu_capacity (preferred) or cpuinfo_max_freq
+        };
+        std::vector<CoreInfo> phys_cores;
+
+        struct dirent* ent = nullptr;
+        while ((ent = ::readdir(dir)) != nullptr) {
+            if (std::strncmp(ent->d_name, "cpu", 3) != 0) continue;
+            const char* num_str = ent->d_name + 3;
+            if (*num_str < '0' || *num_str > '9') continue;
+            char* endp = nullptr;
+            long cpu_id = std::strtol(num_str, &endp, 10);
+            if (!endp || *endp != '\0' || cpu_id < 0) continue;
+
+            const std::string base = std::string("/sys/devices/system/cpu/") + ent->d_name;
+
+            // Skip offline CPUs (cpu0 typically has no online file and is always online)
+            FILE* online_fp = std::fopen((base + "/online").c_str(), "r");
+            if (online_fp) {
+                char obuf[16] = {};
+                bool is_online = (std::fgets(obuf, sizeof(obuf), online_fp) && std::atoi(obuf) != 0);
+                std::fclose(online_fp);
+                if (!is_online) continue;
+            }
+
+            // Deduplicate SMT siblings: keep only the lowest-numbered logical CPU in each core
+            int first_sibling = static_cast<int>(cpu_id);
+            FILE* sib_fp = std::fopen((base + "/topology/core_cpus_list").c_str(), "r");
+            if (!sib_fp) {
+                sib_fp = std::fopen((base + "/topology/thread_siblings_list").c_str(), "r");
+            }
+            if (sib_fp) {
+                char sbuf[128] = {};
+                if (std::fgets(sbuf, sizeof(sbuf), sib_fp)) {
+                    char* sendp = nullptr;
+                    long first_id = std::strtol(sbuf, &sendp, 10);
+                    if (sendp != sbuf && first_id >= 0) {
+                        first_sibling = static_cast<int>(first_id);
+                    }
+                }
+                std::fclose(sib_fp);
+            }
+            if (first_sibling != static_cast<int>(cpu_id)) continue;
+
+            uint64_t score = 0;
+            if (!read_uint_file(base + "/cpu_capacity", score)) {
+                read_uint_file(base + "/cpufreq/cpuinfo_max_freq", score);
+            }
+            phys_cores.push_back({ static_cast<int>(cpu_id), score });
+        }
+        ::closedir(dir);
+
+        if (!phys_cores.empty()) {
+#if defined(__aarch64__) || defined(__arm__)
+            // On heterogeneous ARM64 big.LITTLE SoCs (e.g. Orange Pi 5: 4x A76 + 4x A55;
+            // Orange Pi 6: 8x A720 + 4x A520), select the performance cores so slow LITTLE
+            // cores do not stall ggml thread synchronization barriers.
+            uint64_t min_score = UINT64_MAX;
+            uint64_t max_score = 0;
+            size_t scored_count = 0;
+            for (const auto& c : phys_cores) {
+                if (c.score > 0) {
+                    scored_count++;
+                    if (c.score < min_score) min_score = c.score;
+                    if (c.score > max_score) max_score = c.score;
+                }
+            }
+            if (scored_count == phys_cores.size() && max_score > 0 && min_score * 4 < max_score * 3) {
+                const uint64_t threshold = (max_score * 3) / 4;
+                uint32_t perf_cores = 0;
+                for (const auto& c : phys_cores) {
+                    if (c.score >= threshold) perf_cores++;
+                }
+                if (perf_cores > 0) return perf_cores;
+            }
+#endif
+            return static_cast<uint32_t>(phys_cores.size());
+        }
+    }
+
     FILE* f = std::fopen("/proc/cpuinfo", "r");
     if (f) {
         char line[256];
@@ -114,7 +242,12 @@ uint32_t detect_physical_cores() {
     }
 #endif
     uint32_t hc = std::thread::hardware_concurrency();
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(__arm__)
+    // ARM64 consumer/SBC CPUs do not use 2-way SMT; avoid halving core count.
+    if (hc > 0) return hc;
+#else
     if (hc > 1) return hc / 2;
+#endif
     return 4;
 }
 
@@ -136,6 +269,36 @@ uint64_t query_system_free_ram() {
         uint64_t free_pages = static_cast<uint64_t>(vm_stat.free_count) + static_cast<uint64_t>(vm_stat.inactive_count);
         return free_pages * static_cast<uint64_t>(page_size);
     }
+    return 0;
+#elif defined(__linux__)
+    // Prefer MemAvailable from /proc/meminfo over sysconf(_SC_AVPHYS_PAGES), which only
+    // reports MemFree and ignores reclaimable Linux page cache (critical on 4-16 GiB SBCs).
+    FILE* f = std::fopen("/proc/meminfo", "r");
+    if (f) {
+        char line[256];
+        uint64_t avail_kb = 0;
+        while (std::fgets(line, sizeof(line), f)) {
+            if (std::strncmp(line, "MemAvailable:", 13) == 0) {
+                char* endp = nullptr;
+                unsigned long long v = std::strtoull(line + 13, &endp, 10);
+                if (endp != line + 13 && v > 0) {
+                    avail_kb = static_cast<uint64_t>(v);
+                }
+                break;
+            }
+        }
+        std::fclose(f);
+        if (avail_kb > 0) {
+            return avail_kb * 1024ULL;
+        }
+    }
+#if defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE)
+    long pages = ::sysconf(_SC_AVPHYS_PAGES);
+    long page_sz = ::sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page_sz > 0) {
+        return static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_sz);
+    }
+#endif
     return 0;
 #elif defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE)
     long pages = ::sysconf(_SC_AVPHYS_PAGES);
@@ -172,8 +335,15 @@ bool get_module_dir_utf8(std::string& out) {
     Dl_info info{};
     if (!dladdr(reinterpret_cast<void*>(&get_module_dir_utf8), &info) || !info.dli_fname) return false;
     std::string p = info.dli_fname;
+    char resolved[PATH_MAX];
+    if (::realpath(info.dli_fname, resolved) != nullptr) {
+        p = resolved;
+    }
     size_t slash = p.find_last_of('/');
-    if (slash == std::string::npos) return false;
+    if (slash == std::string::npos) {
+        out = ".";
+        return true;
+    }
     out = (slash == 0) ? "/" : p.substr(0, slash);
     return true;
 #endif
@@ -299,10 +469,11 @@ bool ref_llama_backend(std::string& err_out) {
         // 1. Scan root executable/module directory
         add_to_dll_path(dir, true);
 
-        // 2. Scan existing subdirectories (cuda/, vulkan/)
+        // 2. Scan existing subdirectories (cuda/, vulkan/, opencl/)
         static const char* const subdirs[] = {
             "/cuda",
-            "/vulkan"
+            "/vulkan",
+            "/opencl"
         };
 
         for (const char* sub : subdirs) {
@@ -1272,7 +1443,13 @@ uint32_t calculate_safe_n_ctx(
 
     uint32_t auto_tier_ctx = DEFAULT_FALLBACK_CTX;
     if (total_vram == 0 || n_gpu_layers == 0) {
-        auto_tier_ctx = (free_sys_ram >= (12000ULL * 1024ULL * 1024ULL)) ? 8192 : 4096;
+        if (free_sys_ram >= (12000ULL * 1024ULL * 1024ULL)) {
+            auto_tier_ctx = 8192;
+        } else if (free_sys_ram > 0 && free_sys_ram < (3072ULL * 1024ULL * 1024ULL)) {
+            auto_tier_ctx = 2048;
+        } else {
+            auto_tier_ctx = 4096;
+        }
     } else if (total_vram <= (4600ULL * 1024ULL * 1024ULL)) {
         auto_tier_ctx = 2048;
     } else if (total_vram <= (6500ULL * 1024ULL * 1024ULL)) {
@@ -1331,7 +1508,9 @@ uint32_t calculate_safe_n_ctx(
     }
 
     const uint64_t gpu_headroom = compute_gpu_compute_headroom(total_vram);
-    const uint64_t cpu_headroom = 1024ULL * 1024ULL * 1024ULL;
+    const uint64_t cpu_headroom = (free_sys_ram > 0)
+        ? std::clamp<uint64_t>(free_sys_ram / 6, 256ULL * 1024ULL * 1024ULL, 1024ULL * 1024ULL * 1024ULL)
+        : (1024ULL * 1024ULL * 1024ULL);
 
     uint64_t max_tokens_gpu = UINT64_MAX;
     if (gpu_layers > 0 && free_vram > 0) {
