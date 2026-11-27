@@ -258,7 +258,7 @@ jobs:
         cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}
 
     - name: Build Project
-      if: !(runner.os == 'Linux' && matrix.arch == 'arm64')
+      if: runner.os != 'Linux' || matrix.arch != 'arm64'
       run: cmake --build build --config Release
 
     - name: Stage Artifacts
