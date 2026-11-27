@@ -189,7 +189,7 @@ jobs:
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
             apt-get install -y --no-install-recommends \
-              build-essential cmake ninja-build git curl wget ca-certificates gnupg xz-utils pkg-config binutils
+              build-essential cmake ninja-build git curl wget ca-certificates gnupg xz-utils pkg-config binutils libvulkan1
             git config --global --add safe.directory "*"
 
             # Install Clang 18 from apt.llvm.org for Jammy (supports ARMv8.0..ARMv9.2+SME while linking Ubuntu 22.04 glibc/libstdc++)
@@ -213,7 +213,11 @@ jobs:
                 | tar -xJ -C /opt/vulkan
               GLSLC_BIN="$(find /opt/vulkan -name glslc -type f | head -n 1)"
               VULKAN_SDK="$(dirname "$(dirname "$GLSLC_BIN")")"
-              VULKAN_LIB="$(find "$VULKAN_SDK/lib" -maxdepth 1 \( -name "libvulkan.so" -o -name "libvulkan.so.1" \) | head -n 1)"
+              VULKAN_LIB="$(find /opt/vulkan -name "libvulkan.so*" \( -type f -o -type l \) | sort | head -n 1 || true)"
+              if [ -z "$VULKAN_LIB" ]; then
+                VULKAN_LIB="$(find /usr/lib -name "libvulkan.so.1*" \( -type f -o -type l \) | sort | head -n 1)"
+              fi
+              test -n "$VULKAN_LIB"
               export VULKAN_SDK
               export PATH="$VULKAN_SDK/bin:$PATH"
               export LD_LIBRARY_PATH="$VULKAN_SDK/lib:${LD_LIBRARY_PATH:-}"
