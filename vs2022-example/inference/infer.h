@@ -194,7 +194,7 @@ INFER_API void infer_set_log_callback(infer_log_cb callback, void* user_data);
  * @param out_info Output struct; caller MUST set `out_info->struct_size = sizeof(infer_model_info)` prior to calling.
  * @return `true` on success, `false` if invalid or no model is loaded.
  */
-INFER_API INFER_NODISCARD bool infer_get_model_info(infer_ctx* ctx, infer_model_info* out_info);
+INFER_NODISCARD INFER_API bool infer_get_model_info(infer_ctx* ctx, infer_model_info* out_info);
 
 /**
  * @brief Retrieves the last error string recorded on @p ctx.
@@ -221,7 +221,7 @@ INFER_API infer_model_params infer_model_default_params(void);
  * @brief Initializes the backend and allocates a new `infer_ctx`.
  * @return Newly allocated context handle, or `NULL` on failure.
  */
-INFER_API INFER_NODISCARD infer_ctx* infer_init(void);
+INFER_NODISCARD INFER_API infer_ctx* infer_init(void);
 
 /**
  * @brief Initializes the backend and allocates a new `infer_ctx`, writing diagnostic text on failure.
@@ -229,7 +229,7 @@ INFER_API INFER_NODISCARD infer_ctx* infer_init(void);
  * @param err_buf_size Capacity of @p err_buf in bytes.
  * @return Newly allocated context handle, or `NULL` on failure.
  */
-INFER_API INFER_NODISCARD infer_ctx* infer_init_ex(char* err_buf, size_t err_buf_size);
+INFER_NODISCARD INFER_API infer_ctx* infer_init_ex(char* err_buf, size_t err_buf_size);
 
 /**
  * @brief Loads a GGUF model from @p path using default model parameters.
@@ -240,7 +240,7 @@ INFER_API INFER_NODISCARD infer_ctx* infer_init_ex(char* err_buf, size_t err_buf
  *                      returns `false` if the requested size cannot fit).
  * @return `true` on success, `false` on error.
  */
-INFER_API INFER_NODISCARD bool infer_load_model(infer_ctx* ctx, const char* path, uint32_t requested_ctx);
+INFER_NODISCARD INFER_API bool infer_load_model(infer_ctx* ctx, const char* path, uint32_t requested_ctx);
 
 /**
  * @brief Loads a GGUF model from @p path with explicit GPU offload, mmap, mlock, KV quantization, and Flash Attention controls.
@@ -249,13 +249,13 @@ INFER_API INFER_NODISCARD bool infer_load_model(infer_ctx* ctx, const char* path
  * @param params Pointer to initialized `infer_model_params` (`struct_size` must be non-zero).
  * @return `true` on success, `false` on error.
  */
-INFER_API INFER_NODISCARD bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_params* params);
+INFER_NODISCARD INFER_API bool infer_load_model_ex(infer_ctx* ctx, const char* path, const infer_model_params* params);
 
 /**
  * @brief Unloads the active model and releases all associated VRAM/RAM buffers on @p ctx.
  * @return `true` on success, `false` if @p ctx is null or currently busy generating.
  */
-INFER_API INFER_NODISCARD bool infer_unload_model(infer_ctx* ctx);
+INFER_NODISCARD INFER_API bool infer_unload_model(infer_ctx* ctx);
 
 /**
  * @brief Updates the active sampler chain on @p ctx.
@@ -263,7 +263,7 @@ INFER_API INFER_NODISCARD bool infer_unload_model(infer_ctx* ctx);
  * @param params Pointer to `infer_sampler_params` with `struct_size > 0`.
  * @return `true` on success, `false` on validation failure or busy context.
  */
-INFER_API INFER_NODISCARD bool infer_set_sampler(infer_ctx* ctx, const infer_sampler_params* params);
+INFER_NODISCARD INFER_API bool infer_set_sampler(infer_ctx* ctx, const infer_sampler_params* params);
 
 /**
  * @brief Overrides the chat template used by `infer_generate_chat*` and `infer_generate_chat_turn*`.
@@ -271,7 +271,7 @@ INFER_API INFER_NODISCARD bool infer_set_sampler(infer_ctx* ctx, const infer_sam
  * @param custom_template Jinja/named chat template string, or `NULL` / `""` to revert to the model's built-in template.
  * @return `true` on success, `false` if busy.
  */
-INFER_API INFER_NODISCARD bool infer_set_chat_template(infer_ctx* ctx, const char* custom_template);
+INFER_NODISCARD INFER_API bool infer_set_chat_template(infer_ctx* ctx, const char* custom_template);
 
 /**
  * @brief Aborts any in-flight generation, waits for completion, frees all model/context resources,
@@ -294,19 +294,19 @@ INFER_API uint32_t infer_get_kv_cache_token_count(infer_ctx* ctx);
  *        calls can seamlessly continue the conversation.
  * @param max_tokens Maximum tokens to generate (`<= 0` caps at active `n_ctx`).
  */
-INFER_API INFER_NODISCARD bool infer_generate_chat(infer_ctx* ctx, const infer_chat_msg* msgs, size_t num_msgs, int32_t max_tokens, infer_stream_cb callback, void* user_data);
+INFER_NODISCARD INFER_API bool infer_generate_chat(infer_ctx* ctx, const infer_chat_msg* msgs, size_t num_msgs, int32_t max_tokens, infer_stream_cb callback, void* user_data);
 
 /** Binary-safe v2 callback variant of `infer_generate_chat()`. */
-INFER_API INFER_NODISCARD bool infer_generate_chat_v2(infer_ctx* ctx, const infer_chat_msg* msgs, size_t num_msgs, int32_t max_tokens, infer_stream_cb_v2 callback, void* user_data);
+INFER_NODISCARD INFER_API bool infer_generate_chat_v2(infer_ctx* ctx, const infer_chat_msg* msgs, size_t num_msgs, int32_t max_tokens, infer_stream_cb_v2 callback, void* user_data);
 
 /**
  * @brief Launches asynchronous chat generation on a background worker thread.
  *        Use `infer_wait()` followed by `infer_last_success()` to check completion status.
  */
-INFER_API INFER_NODISCARD bool infer_generate_chat_async(infer_ctx* ctx, const infer_chat_msg* msgs, size_t num_msgs, int32_t max_tokens, infer_stream_cb callback, void* user_data);
+INFER_NODISCARD INFER_API bool infer_generate_chat_async(infer_ctx* ctx, const infer_chat_msg* msgs, size_t num_msgs, int32_t max_tokens, infer_stream_cb callback, void* user_data);
 
 /** Binary-safe v2 callback variant of `infer_generate_chat_async()`. */
-INFER_API INFER_NODISCARD bool infer_generate_chat_async_v2(infer_ctx* ctx, const infer_chat_msg* msgs, size_t num_msgs, int32_t max_tokens, infer_stream_cb_v2 callback, void* user_data);
+INFER_NODISCARD INFER_API bool infer_generate_chat_async_v2(infer_ctx* ctx, const infer_chat_msg* msgs, size_t num_msgs, int32_t max_tokens, infer_stream_cb_v2 callback, void* user_data);
 
 /**
  * @brief Appends a single turn (`role`, `content`) to the active conversation, pruning whole
@@ -314,47 +314,47 @@ INFER_API INFER_NODISCARD bool infer_generate_chat_async_v2(infer_ctx* ctx, cons
  *        Note: Once the prompt is prefilled into the KV cache, the user turn remains in history
  *        even if generation is subsequently aborted by the caller.
  */
-INFER_API INFER_NODISCARD bool infer_generate_chat_turn(infer_ctx* ctx, const char* role, const char* content, int32_t max_tokens, infer_stream_cb callback, void* user_data);
+INFER_NODISCARD INFER_API bool infer_generate_chat_turn(infer_ctx* ctx, const char* role, const char* content, int32_t max_tokens, infer_stream_cb callback, void* user_data);
 
 /** Binary-safe v2 callback variant of `infer_generate_chat_turn()`. */
-INFER_API INFER_NODISCARD bool infer_generate_chat_turn_v2(infer_ctx* ctx, const char* role, const char* content, int32_t max_tokens, infer_stream_cb_v2 callback, void* user_data);
+INFER_NODISCARD INFER_API bool infer_generate_chat_turn_v2(infer_ctx* ctx, const char* role, const char* content, int32_t max_tokens, infer_stream_cb_v2 callback, void* user_data);
 
 /**
  * @brief Runs raw text completion without chat template formatting or special-token neutralization.
  * @param max_tokens Maximum tokens to generate (`<= 0` caps at active `n_ctx`).
  */
-INFER_API INFER_NODISCARD bool infer_generate_completion(infer_ctx* ctx, const char* raw_prompt, int32_t max_tokens, infer_stream_cb callback, void* user_data);
+INFER_NODISCARD INFER_API bool infer_generate_completion(infer_ctx* ctx, const char* raw_prompt, int32_t max_tokens, infer_stream_cb callback, void* user_data);
 
 /** Binary-safe v2 callback variant of `infer_generate_completion()`. */
-INFER_API INFER_NODISCARD bool infer_generate_completion_v2(infer_ctx* ctx, const char* raw_prompt, int32_t max_tokens, infer_stream_cb_v2 callback, void* user_data);
+INFER_NODISCARD INFER_API bool infer_generate_completion_v2(infer_ctx* ctx, const char* raw_prompt, int32_t max_tokens, infer_stream_cb_v2 callback, void* user_data);
 
 /**
  * @brief Configures stop sequences that halt generation and roll back trailing stop tokens.
  *        Every stop sequence must be non-null and between 1 and 256 bytes in length.
  */
-INFER_API INFER_NODISCARD bool infer_set_stop_sequences(infer_ctx* ctx, const char* const* stop_words, size_t num_words);
+INFER_NODISCARD INFER_API bool infer_set_stop_sequences(infer_ctx* ctx, const char* const* stop_words, size_t num_words);
 
 /**
  * @brief Sets or clears (`NULL` / `""`) a GBNF grammar constraint on the sampler chain.
  */
-INFER_API INFER_NODISCARD bool infer_set_grammar(infer_ctx* ctx, const char* grammar_gbnf);
+INFER_NODISCARD INFER_API bool infer_set_grammar(infer_ctx* ctx, const char* grammar_gbnf);
 
 /**
  * @brief Clears the KV cache, resets sampler state, and empties stored chat history.
  * @return `true` on success, `false` if @p ctx is null, busy, or encounters an internal error.
  */
-INFER_API INFER_NODISCARD bool infer_memory_clear(infer_ctx* ctx);
+INFER_NODISCARD INFER_API bool infer_memory_clear(infer_ctx* ctx);
 
 /**
  * @brief Atomically saves KV cache state and chat history to @p filepath with permissions `0600`
  *        and full-file CRC32 integrity verification.
  */
-INFER_API INFER_NODISCARD bool infer_state_save(infer_ctx* ctx, const char* filepath);
+INFER_NODISCARD INFER_API bool infer_state_save(infer_ctx* ctx, const char* filepath);
 
 /**
  * @brief Restores KV cache state and validated/neutralized chat history from @p filepath.
  */
-INFER_API INFER_NODISCARD bool infer_state_load(infer_ctx* ctx, const char* filepath);
+INFER_NODISCARD INFER_API bool infer_state_load(infer_ctx* ctx, const char* filepath);
 
 /** @return Embedding dimension (`n_embd`) of the loaded model, or `0` if none. */
 INFER_API int32_t infer_get_embedding_dim(infer_ctx* ctx);
@@ -365,12 +365,12 @@ INFER_API int32_t infer_get_embedding_dim(infer_ctx* ctx);
  *        the last token's unnormalized hidden state is returned). Use `infer_get_embeddings_ex()`
  *        to optionally L2-normalize the output vector.
  */
-INFER_API INFER_NODISCARD bool infer_get_embeddings(infer_ctx* ctx, const char* text, float* out_vec, size_t vec_len);
+INFER_NODISCARD INFER_API bool infer_get_embeddings(infer_ctx* ctx, const char* text, float* out_vec, size_t vec_len);
 
 /**
  * @brief Computes embeddings for @p text into @p out_vec, with optional L2 normalization.
  */
-INFER_API INFER_NODISCARD bool infer_get_embeddings_ex(infer_ctx* ctx, const char* text, float* out_vec, size_t vec_len, bool normalize);
+INFER_NODISCARD INFER_API bool infer_get_embeddings_ex(infer_ctx* ctx, const char* text, float* out_vec, size_t vec_len, bool normalize);
 
 /** Signals an asynchronous abort to any in-flight generation or embedding call on @p ctx. */
 INFER_API void infer_abort(infer_ctx* ctx);
