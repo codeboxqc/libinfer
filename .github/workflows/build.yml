@@ -79,19 +79,22 @@ jobs:
         git clone --depth 1 https://github.com/ggml-org/llama.cpp.git third_party/llama.cpp
 
     - name: Ensure Linux Build Dependencies
-      if: runner.os == 'Linux'
+      if: runner.os == 'Linux' && matrix.arch != 'arm64'
       run: |
         sudo apt-get update
         PKGS="ninja-build zip"
         if [ "${{ matrix.use_cuda }}" = "true" ]; then
           PKGS="$PKGS libxml2"
         fi
-        if [ "${{ matrix.arch }}" = "arm64" ]; then
-          # Clang 18 supports ARMv8.0 through ARMv9.2 (dotprod, i8mm, sve, sme) for GGML_CPU_ALL_VARIANTS.
-          # Native Ubuntu ARM64 Vulkan packages provide libvulkan and glslc reliably for SBCs (Orange Pi 5/6).
-          PKGS="$PKGS clang libvulkan-dev glslc spirv-headers"
-        fi
         sudo apt-get install -y $PKGS
+
+    - name: Ensure Zip on Linux ARM64 Host
+      if: runner.os == 'Linux' && matrix.arch == 'arm64'
+      run: |
+        if ! command -v zip >/dev/null 2>&1; then
+          sudo apt-get update
+          sudo apt-get install -y zip
+        fi
 
     - name: Ensure macOS Build Dependencies
       if: runner.os == 'macOS'
@@ -168,18 +171,76 @@ jobs:
         }
         cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF @extraFlags
 
-    - name: Configure CMake (Linux & macOS)
-      if: runner.os != 'Windows'
+    - name: Configure & Build in Ubuntu 22.04 Container (Linux ARM64 - GLIBC 2.35 compatible)
+      if: runner.os == 'Linux' && matrix.arch == 'arm64'
+      shell: bash
+      run: |
+        # Build inside ubuntu:22.04 on the ubuntu-24.04-arm runner so binaries link against
+        # GLIBC 2.35 + GLIBCXX 3.4.30 (compatible with Orange Pi 5/6 Ubuntu 22.04, Debian 12, and Ubuntu 24.04+)
+        # without depending on the deprecated ubuntu-22.04-arm GitHub runner.
+        docker run --rm \
+          -v "$PWD:/work" \
+          -w /work \
+          -e HOST_UID="$(id -u)" \
+          -e HOST_GID="$(id -g)" \
+          -e USE_VULKAN="${{ matrix.use_vulkan }}" \
+          -e CPU_ALL_VARIANTS="${{ matrix.cpu_all_variants }}" \
+          ubuntu:22.04 bash -euxo pipefail -c '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              build-essential cmake ninja-build git curl wget ca-certificates gnupg xz-utils pkg-config binutils
+            git config --global --add safe.directory "*"
+
+            # Install Clang 18 from apt.llvm.org for Jammy (supports ARMv8.0..ARMv9.2+SME while linking Ubuntu 22.04 glibc/libstdc++)
+            wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key > /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+            echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" > /etc/apt/sources.list.d/llvm.list
+            apt-get update
+            apt-get install -y --no-install-recommends clang-18
+
+            export CC=clang-18
+            export CXX=clang++-18
+            clang-18 --version
+
+            EXTRA_FLAGS=(-DGGML_OPENMP=OFF)
+            if [ "$CPU_ALL_VARIANTS" = "true" ]; then
+              EXTRA_FLAGS+=(-DGGML_CPU_ALL_VARIANTS=ON)
+            fi
+
+            if [ "$USE_VULKAN" = "true" ]; then
+              mkdir -p /opt/vulkan
+              curl -fsSL "https://github.com/jakoch/vulkan-sdk-arm/releases/download/1.4.357.1/vulkansdk-ubuntu-22.04-arm-1.4.357.1.tar.xz" \
+                | tar -xJ -C /opt/vulkan
+              GLSLC_BIN="$(find /opt/vulkan -name glslc -type f | head -n 1)"
+              VULKAN_SDK="$(dirname "$(dirname "$GLSLC_BIN")")"
+              VULKAN_LIB="$(find "$VULKAN_SDK/lib" -maxdepth 1 \( -name "libvulkan.so" -o -name "libvulkan.so.1" \) | head -n 1)"
+              export VULKAN_SDK
+              export PATH="$VULKAN_SDK/bin:$PATH"
+              export LD_LIBRARY_PATH="$VULKAN_SDK/lib:${LD_LIBRARY_PATH:-}"
+              export PKG_CONFIG_PATH="$VULKAN_SDK/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+              echo "Using VULKAN_SDK=$VULKAN_SDK (lib=$VULKAN_LIB)"
+              "$GLSLC_BIN" --version
+              EXTRA_FLAGS+=(
+                -DGGML_VULKAN=ON
+                "-DVulkan_INCLUDE_DIR=$VULKAN_SDK/include"
+                "-DVulkan_LIBRARY=$VULKAN_LIB"
+                "-DVulkan_GLSLC_EXECUTABLE=$GLSLC_BIN"
+              )
+            fi
+
+            cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF "${EXTRA_FLAGS[@]}"
+            cmake --build build --config Release
+
+            echo "=== Required GLIBC / GLIBCXX versions (libinfer.so) ==="
+            objdump -T build/libinfer.so | grep -oE "GLIBC_[0-9.]+|GLIBCXX_[0-9.]+" | sort -uV || true
+            chown -R "$HOST_UID:$HOST_GID" build
+          '
+
+    - name: Configure CMake (Linux x64 & macOS)
+      if: runner.os != 'Windows' && !(runner.os == 'Linux' && matrix.arch == 'arm64')
       shell: bash
       run: |
         EXTRA_FLAGS=()
-        if [ "${{ runner.os }}" = "Linux" ] && [ "${{ matrix.arch }}" = "arm64" ]; then
-          export CC=clang
-          export CXX=clang++
-          clang --version
-          # Avoid requiring libomp.so.5 on target SBCs (Orange Pi 5/6); ggml uses its native pthread pool.
-          EXTRA_FLAGS+=(-DGGML_OPENMP=OFF)
-        fi
         if [ "${{ matrix.cpu_all_variants }}" = "true" ]; then
           EXTRA_FLAGS+=(-DGGML_CPU_ALL_VARIANTS=ON)
         fi
@@ -197,6 +258,7 @@ jobs:
         cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}
 
     - name: Build Project
+      if: !(runner.os == 'Linux' && matrix.arch == 'arm64')
       run: cmake --build build --config Release
 
     - name: Stage Artifacts
