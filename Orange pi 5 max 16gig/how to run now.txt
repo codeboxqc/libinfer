@@ -1,0 +1,128 @@
+Option A — Quick Fix (10 Seconds, No Reboot)
+
+Right now your UI shows RKLLM NPU Bridge (v1.2 ABI) paired with Kernel RKNPU v0.9.6. If you want your downloaded Qwen2.5-Coder-7B .rkllm running on the 6-TOPS NPU right now without upgrading the kernel:
+
+bash
+cd /media/sam/MAXSUN5121/orange10g
+./scripts/install_rkllm_runtime.sh --version release-v1.1.4
+
+(Then restart ./run.sh --https.)
+
+Option B — Step-by-Step Upgrade to Kernel RKNPU 0.9.8 (For Qwen3-8B 16K NPU)
+
+Your board already has deb-src configured for linux-rockchip (5.10.0-1012.12) and 373 GB free on your NVMe, so the script builds a drop-in .deb from your exact running kernel source (keeping your current kernel untouched as fallback):
+
+Build the patched RKNPU 0.9.8 kernel .deb (~15–25 min on 8 cores; keep fan on — does NOT install or reboot automatically):
+
+bash
+cd /media/sam/MAXSUN5121/orange10g
+./scripts/upgrade_rknpu_098.sh --build-098
+
+(Automatically fetches linux-rockchip 5.10.0-1012.12, swaps in Rockchip's official rknpu_driver_0.9.8, applies the two Linux 5.10 compatibility patches for vm_flags_set and rknpu_devfreq.c, and compiles linux-image-*rknpu098*.deb in /media/sam/MAXSUN5121/rknpu-098-build/.)
+
+Back up /boot and install the new kernel .deb:
+
+bash
+sudo cp -a /boot /boot.bak-before-rknpu098
+sudo dpkg -i /media/sam/MAXSUN5121/rknpu-098-build/linux-image-*rknpu098*.deb
+sudo u-boot-update 2>/dev/null || true
+
+Reboot & verify 0.9.8:
+
+bash
+sudo reboot
+# After reboot:
+cat /sys/module/rknpu/version
+# Expected output: 0.9.8
+
+Match RKLLM runtime (v1.2.1) and launch Qwen3-8B 16K on the 6-TOPS NPU:
+
+bash
+cd /media/sam/MAXSUN5121/orange10g
+./scripts/install_rkllm_runtime.sh --version release-v1.2.1
+sudo ./scripts/tune_opi5max.sh
+./run.sh --https --preset qwen3-8b-rkllm
+
+
+
+Step 1 — Back Up /boot & Install Both .deb Files (Headers First!)
+
+Run these commands in your terminal:
+
+bash
+sudo cp -a /boot /boot.bak-before-rknpu098
+sudo dpkg -i \
+  /media/sam/MAXSUN5121/orange10g/.rknpu-098-build/linux-headers-5.10.209-rknpu098_1_arm64.deb \
+  /media/sam/MAXSUN5121/orange10g/.rknpu-098-build/linux-image-5.10.209-rknpu098_1_arm64.deb
+sudo u-boot-update
+Step 2 — Quick Pre-Reboot Sanity Check
+
+Before rebooting, verify that initrd.img-5.10.209-rknpu098 and both l0 (5.10.209-rknpu098) and l1 (5.10.0-1012-rockchip fallback) exist:
+
+bash
+ls -lh /boot/*5.10.209-rknpu098*
+cat /boot/extlinux/extlinux.conf
+
+(If anything looks off in that output, paste it here before rebooting!)
+
+Step 3 — Reboot & Verify RKNPU 0.9.8
+bash
+sudo reboot
+
+After your Orange Pi 5 Max comes back up:
+
+bash
+uname -r                        # -> 5.10.209-rknpu098
+cat /sys/module/rknpu/version   # -> 0.9.8
+Step 4 — Upgrade Orange10G NPU Runtime to v1.2.1 & Launch
+
+Once cat /sys/module/rknpu/version prints 0.9.8, switch the RKLLM NPU bridge to v1.2.1 to unlock Qwen3-8B 16K on the 6-TOPS NPU (details also in RKNPU_UPGRADE.md):
+
+bash
+cd /media/sam/MAXSUN5121/orange10g
+./scripts/install_rkllm_runtime.sh --version release-v1.2.1
+sudo ./scripts/tune_opi5max.sh
+./run.sh --https
+..............................................................
+
+How to Start & Test Both Models Right Now
+bash
+cd /media/sam/MAXSUN5121/orange10g
+# 1. Enable RK3588 Turbo Mode (locks 2.4 GHz DDR + 1.0 GHz NPU + A76 big cores)
+sudo ./scripts/tune_opi5max.sh
+# 2. Install the 6-TOPS NPU runtime bridge (auto-matches your RKNPU v0.9.6 now, or v0.9.8 after upgrade)
+./scripts/install_rkllm_runtime.sh
+# 3. Launch Orange10G (then open the Web UI -> Models tab to 1-click download & compare!)
+./run.sh --https
+
+Or launch directly into either preset you chose:
+
+bash
+./run.sh --https --preset qwen25-coder-7b-rkllm   # 2A: 6-TOPS NPU (.rkllm, works on RKNPU 0.9.6 now)
+./run.sh --https --preset gpt-oss-20b-mxfp4       # 2C: 11.3 GB Sparse MoE (.gguf, 3.6B active)
+./run.sh --https --preset qwen3-8b-rkllm          # 2A+: Qwen3-8B 16K NPU (after RKNPU 0.9.8 upgrade)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+How Anyone Cloning From GitHub Runs Either Project
+bash
+# For orange:
+unzip orange.zip && cd orange
+./run.sh --https          # Auto-compiles build/opi_ai on first run, downloads voices/models, and starts!
+# For orange10g:
+unzip orange10g.zip && cd orange10g
+./scripts/install_rkllm_runtime.sh   # Optional: enables 6-TOPS NPU (.rkllm)
+sudo ./scripts/tune_opi5max.sh       # Optional: locks RK3588 turbo clocks
+./run.sh --https                     # Auto-compiles build/opi_ai_10g on first run and starts!
